@@ -1,0 +1,130 @@
+/* Obsynk settings tab. Scoped under .obsynk-settings (set on the tab's
+   containerEl) so nothing here leaks into other plugins' settings UI. */
+
+.obsynk-settings {
+	/* Fill whatever width Obsidian's settings pane actually gives us
+	   (which can be most of a maximized window) instead of capping to an
+	   arbitrary narrow column and leaving the rest as dead space. Only
+	   guard against absurdly long input/text lines on ultra-wide windows. */
+	max-width: 1100px;
+}
+
+.obsynk-settings h2 {
+	margin-bottom: 4px;
+}
+
+.obsynk-hint {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin: 0 0 1.5em 0;
+}
+
+.obsynk-status {
+	padding: 16px 20px;
+	border-radius: var(--radius-m);
+	background: var(--background-secondary);
+	border-left: 3px solid var(--text-muted);
+	margin-bottom: 1.5em;
+	overflow-wrap: anywhere;
+	font-size: var(--font-ui-small);
+}
+
+.obsynk-status.is-connected {
+	border-left-color: var(--color-green);
+}
+
+.obsynk-status.is-disconnected {
+	border-left-color: var(--text-muted);
+}
+
+.obsynk-status.is-error {
+	border-left-color: var(--color-red);
+	color: var(--text-error);
+}
+
+.obsynk-folder-link {
+	margin: -1em 0 1.5em 0;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}
+
+.obsynk-folder-link a {
+	color: var(--link-color);
+	cursor: pointer;
+}
+
+/* Long text values (OAuth client ID/secret, Drive folder name) don't fit
+   Obsidian's default side-by-side label+control layout without truncating
+   or overflowing -- stack the label above a full-width input instead.
+   Default theme padding on .setting-item is tuned for a compact single-line
+   row; stacked vertically it leaves the actual input looking like an
+   afterthought in a mostly-empty card, so it's tightened and the input
+   itself is made bigger/more prominent here. */
+.obsynk-settings .obsynk-wide-setting {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 12px;
+	/* padding set further down, after the generic .setting-item rule, so
+	   it wins the cascade tie on rows that carry both classes */
+}
+
+.obsynk-settings .obsynk-wide-setting .setting-item-info {
+	margin-right: 0;
+}
+
+.obsynk-settings .obsynk-wide-setting .setting-item-name {
+	font-size: var(--font-ui-medium);
+}
+
+.obsynk-settings .obsynk-wide-setting .setting-item-control {
+	width: 100%;
+}
+
+.obsynk-settings .obsynk-wide-setting .setting-item-control input {
+	width: 100%;
+	max-width: 640px;
+	height: 3em;
+	padding: 0 16px;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-medium);
+	border-radius: var(--radius-s);
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+}
+
+.obsynk-settings .obsynk-wide-setting .setting-item-control input:focus {
+	border-color: var(--interactive-accent);
+}
+
+.obsynk-settings .setting-item-description {
+	overflow-wrap: anywhere;
+}
+
+/* Applies to every row first (including obsynk-wide-setting rows, since
+   setClass() adds a class alongside setting-item rather than replacing
+   it) -- .obsynk-wide-setting's own padding/gap rule above must come
+   AFTER this one in the cascade to win the tie on those rows. */
+.obsynk-settings .setting-item {
+	flex-wrap: wrap;
+	padding: 18px;
+	margin-bottom: 10px;
+}
+
+.obsynk-settings .obsynk-wide-setting {
+	padding: 20px 18px;
+}
+
+.obsynk-settings .setting-item-control button {
+	min-height: 2.75em;
+	padding: 0 24px;
+	font-size: var(--font-ui-medium);
+}
+
+.obsynk-sync-progress {
+	margin: -0.5em 0 1.5em 0;
+	padding: 8px 14px;
+	border-radius: var(--radius-m);
+	background: var(--background-secondary);
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}

@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package obsynk.v1;
+
+option go_package = "obsynk/gen/go/obsynk/v1;obsynkv1";
+
+service ObsynkService {
+  // Triggered by a debounced batch of vault file events.
+  rpc SyncPaths(SyncPathsRequest) returns (stream SyncProgress);
+
+  // Manual "Sync now" -- full vault reconcile.
+  rpc FullSync(FullSyncRequest) returns (stream SyncProgress);
+
+  // Current daemon/connection/last-sync status.
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+
+  // Kicks off the OAuth installed-app flow; streams back the authorize URL
+  // so the plugin can open it via Electron shell.openExternal, then a final
+  // "connected" event once the local redirect capture completes.
+  rpc StartLogin(StartLoginRequest) returns (stream LoginEvent);
+
+  rpc GetConfig(GetConfigRequest) returns (ConfigResponse);
+  rpc SetConfig(SetConfigRequest) returns (ConfigResponse);
+
+  // Graceful stop, called on plugin onunload.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message FileEvent {
+  string relative_path = 1;
+
+  enum Kind {
+    MODIFY = 0;
+    CREATE = 1;
+    DELETE = 2;
+    RENAME = 3;
+  }
+  Kind kind = 2;
+
+  // Set only for RENAME.
+  string old_relative_path = 3;
+}
+
+message SyncPathsRequest {
+  repeated FileEvent events = 1;
+}
+
+message FullSyncRequest {}
+
+message SyncProgress {
+  string relative_path = 1;
+
+  enum Op {
+    PUSH = 0;
+    PULL = 1;
+    PUSH_DELETE = 2;
+    PULL_DELETE = 3;
+    CONFLICT_RESOLVED = 4;
+    SKIPPED = 5;
+  }
+  Op op = 2;
+
+  enum Status {
+    STARTED = 0;
+    SUCCEEDED = 1;
+    FAILED = 2;
+  }
+  Status status = 3;
+
+  string error_message = 4;
+
+  // Total operations in this sync batch, repeated on every message (not
+  // just the first) so the client can compute progress/percentage without
+  // needing to track a separate "batch started" event.
+  int32 total_operations = 5;
+}
+
+message GetStatusRequest {}
+
+message StatusResponse {
+  bool drive_connected = 1;
+  string drive_account_email = 2;
+  int64 last_sync_unix_ms = 3;
+  int32 pending_operations = 4;
+  string daemon_version = 5;
+}
+
+message StartLoginRequest {
+  string client_id = 1;
+  string client_secret = 2;
+}
+
+message LoginEvent {
+  oneof event {
+    string authorize_url = 1;
+    bool connected = 2;
+    string error = 3;
+  }
+}
+
+message GetConfigRequest {}
+
+message SetConfigRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  string drive_root_folder_name = 3;
+}
+
+message ConfigResponse {
+  string client_id = 1;
+  // Never echo the secret back.
+  bool has_client_secret = 2;
+  string drive_root_folder_name = 3;
+  string drive_root_folder_id = 4;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}

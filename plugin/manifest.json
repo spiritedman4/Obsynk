@@ -1,0 +1,10 @@
+{
+  "id": "obsynk",
+  "name": "Obsynk",
+  "version": "0.0.1",
+  "minAppVersion": "1.4.0",
+  "description": "Two-way sync between this vault and a folder in your Google Drive, powered by a local Go daemon.",
+  "author": "sivamsrini214",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

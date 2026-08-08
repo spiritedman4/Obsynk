@@ -1,0 +1,35 @@
+# --- Build artifacts (regenerate with build.ps1) ---
+plugin/node_modules/
+plugin/main.js
+plugin/main.js.map
+plugin/bin/*/obsynkd
+plugin/bin/*/obsynkd.exe
+plugin/.test-build/
+/gen/go/obsynk/v1/*.pb.go.bak
+
+# Note: plugin/package-lock.json IS committed on purpose, for reproducible
+# installs. Generated Go bindings under gen/ are committed too, so the repo
+# can be built without installing buf.
+
+# --- Local tooling ---
+.claude/settings.local.json
+
+# --- Secrets and per-vault state ---
+# These belong only inside a real vault's .obsidian/plugins/obsynk/ folder,
+# never in this repo. The patterns below are a safety net in case a test
+# vault is ever created underneath the repo. Note that the sync state file
+# is deliberately NOT named manifest.json -- that name collides with
+# Obsidian's own plugin manifest.json, which lives in the same folder.
+**/.obsidian/plugins/obsynk/config.json
+**/.obsidian/plugins/obsynk/token.json
+**/.obsidian/plugins/obsynk/sync-state.json
+**/.obsidian/plugins/obsynk/daemon.lock
+**/.obsidian/plugins/obsynk/obsynk.log
+**/.obsidian/plugins/obsynk/obsynkd.log
+
+# Belt-and-braces: never commit an OAuth token or client-secret file,
+# wherever it turns up.
+**/token.json
+**/client_secret*.json
+**/credentials.json
+*.log

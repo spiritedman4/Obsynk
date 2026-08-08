@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Obsynk logo: a faceted obsidian gem encircled by sync arrows">
+  <defs>
+    <linearGradient id="arrowGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Sync ring: two arcs sweeping clockwise, each ending in an arrowhead -->
+  <g fill="none" stroke="url(#arrowGrad)" stroke-width="24" stroke-linecap="round">
+    <path d="M 331 71 A 200 200 0 0 1 414 379"/>
+    <path d="M 181 441 A 200 200 0 0 1 98 133"/>
+  </g>
+  <g fill="url(#arrowGrad)">
+    <polygon points="395,403 400,368 428,390"/>
+    <polygon points="117,109 112,144 84,122"/>
+  </g>
+
+  <!-- Faceted obsidian gem -->
+  <g>
+    <polygon points="256,120 162,205 256,250" fill="#b39dff"/>
+    <polygon points="256,120 350,205 256,250" fill="#8b6dff"/>
+    <polygon points="162,205 202,340 256,390 256,250" fill="#6d4fd6"/>
+    <polygon points="350,205 310,340 256,390 256,250" fill="#4c2f9e"/>
+    <!-- Specular sheen across the crown -->
+    <polygon points="256,120 162,205 256,250" fill="url(#glow)"/>
+    <!-- Facet edges -->
+    <g fill="none" stroke="#1e1136" stroke-width="6" stroke-linejoin="round">
+      <polygon points="256,120 350,205 310,340 256,390 202,340 162,205"/>
+      <path d="M 162 205 L 256 250 L 350 205 M 256 120 L 256 250 M 256 250 L 256 390"/>
+    </g>
+  </g>
+</svg>
