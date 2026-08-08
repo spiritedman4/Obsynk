@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, TextComponent } from "obsidian";
 
 import type ObsynkPlugin from "../main";
 import type { LoginEvent } from "../grpc/client";
@@ -27,9 +27,14 @@ export class ObsynkSettingTab extends PluginSettingTab {
 		}
 		const daemon = this.plugin.daemon;
 
-		let clientId = "";
-		let clientSecret = "";
-		let rootFolderName = "";
+		// Held so the async config fetch below can populate them once it
+		// returns -- the Setting rows are built synchronously, before the
+		// daemon has answered, so seeding them with plain variables would
+		// always render them empty even when credentials are saved.
+		let clientIdInput: TextComponent | null = null;
+		let secretInput: TextComponent | null = null;
+		let folderInput: TextComponent | null = null;
+		let hasSavedSecret = false;
 
 		const statusEl = containerEl.createEl("p", { cls: "obsynk-status", text: "Loading status..." });
 		const setStatusState = (state: "connected" | "disconnected" | "error") => {
@@ -54,8 +59,19 @@ export class ObsynkSettingTab extends PluginSettingTab {
 		const refreshStatus = async () => {
 			try {
 				const [status, config] = await Promise.all([daemon.client.getStatus(), daemon.client.getConfig()]);
-				clientId = config.client_id;
-				rootFolderName = config.drive_root_folder_name;
+
+				// Reflect saved config back into the inputs. The secret is
+				// deliberately never sent back by the daemon (GetConfig only
+				// reports whether one exists), so we show a placeholder
+				// rather than putting a live credential in the DOM.
+				clientIdInput?.setValue(config.client_id);
+				folderInput?.setValue(config.drive_root_folder_name);
+				hasSavedSecret = config.has_client_secret;
+				if (secretInput) {
+					secretInput.setPlaceholder(
+						hasSavedSecret ? "Saved — leave blank to reuse" : "Paste your client secret",
+					);
+				}
 
 				if (status.drive_connected) {
 					const lastSync =
@@ -87,56 +103,85 @@ export class ObsynkSettingTab extends PluginSettingTab {
 			.setName("Google OAuth Client ID")
 			.setDesc("From your own Google Cloud project (OAuth client, application type: Desktop app).")
 			.setClass("obsynk-wide-setting")
-			.addText((text) => text.setValue(clientId).onChange((v) => (clientId = v)));
+			.addText((text) => {
+				clientIdInput = text;
+				text.setPlaceholder("xxxxx.apps.googleusercontent.com");
+			});
 
 		new Setting(containerEl)
 			.setName("Google OAuth Client Secret")
+			.setDesc("Stored locally in this vault's plugin folder; never uploaded to Drive.")
 			.setClass("obsynk-wide-setting")
 			.addText((text) => {
+				secretInput = text;
 				text.inputEl.type = "password";
-				text.onChange((v) => (clientSecret = v));
 			});
 
 		new Setting(containerEl)
 			.setName("Drive root folder name")
 			.setDesc('Defaults to "Obsidian Vault - <vault name>" if left blank.')
 			.setClass("obsynk-wide-setting")
-			.addText((text) => text.setValue(rootFolderName).onChange((v) => (rootFolderName = v)));
+			.addText((text) => {
+				folderInput = text;
+			});
 
-		new Setting(containerEl).setName("Connect to Google Drive").addButton((btn) =>
-			btn
-				.setButtonText("Connect")
-				.setCta()
-				.onClick(async () => {
-					if (!clientId || !clientSecret) {
-						new Notice("Enter both Client ID and Client Secret first.");
-						return;
-					}
-					try {
-						await daemon.client.setConfig({
-							client_id: clientId,
-							client_secret: clientSecret,
-							drive_root_folder_name: rootFolderName,
-						});
-						await daemon.client.startLogin(clientId, clientSecret, (ev: LoginEvent) => {
-							if ("authorize_url" in ev) {
-								new Notice("Opening your browser to connect Google Drive...");
-								// electron is external to the esbuild bundle; require it at
-								// runtime the same way any Obsidian desktop plugin does.
-								// eslint-disable-next-line @typescript-eslint/no-var-requires
-								require("electron").shell.openExternal(ev.authorize_url);
-							} else if ("connected" in ev) {
-								new Notice("Connected to Google Drive!");
-								void refreshStatus();
-							} else if ("error" in ev) {
-								new Notice(`Connection failed: ${ev.error}`);
-							}
-						});
-					} catch (e) {
-						new Notice(`Connection failed: ${(e as Error).message}`);
-					}
-				}),
-		);
+		new Setting(containerEl)
+			.setName("Connect to Google Drive")
+			.setDesc(
+				"Google expires test-user tokens after 7 days, so this needs re-running about weekly. " +
+					"Your saved credentials are reused — you only need to re-enter them if they change.",
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Connect")
+					.setCta()
+					.onClick(async () => {
+						const clientId = clientIdInput?.getValue().trim() ?? "";
+						// Blank means "reuse the saved one": the daemon falls back to
+						// its stored secret, and SetConfig ignores an empty value
+						// rather than wiping what's there.
+						const typedSecret = secretInput?.getValue() ?? "";
+						const rootFolderName = folderInput?.getValue().trim() ?? "";
+
+						if (!clientId) {
+							new Notice("Enter your Google OAuth Client ID first.");
+							return;
+						}
+						if (!typedSecret && !hasSavedSecret) {
+							new Notice("Enter your Google OAuth Client Secret first.");
+							return;
+						}
+
+						btn.setDisabled(true);
+						try {
+							await daemon.client.setConfig({
+								client_id: clientId,
+								client_secret: typedSecret,
+								drive_root_folder_name: rootFolderName,
+							});
+							await daemon.client.startLogin(clientId, typedSecret, (ev: LoginEvent) => {
+								if ("authorize_url" in ev) {
+									new Notice("Opening your browser to connect Google Drive...");
+									// electron is external to the esbuild bundle; require it at
+									// runtime the same way any Obsidian desktop plugin does.
+									// eslint-disable-next-line @typescript-eslint/no-var-requires
+									require("electron").shell.openExternal(ev.authorize_url);
+								} else if ("connected" in ev) {
+									new Notice("Connected to Google Drive!");
+									// Don't leave a live credential sitting in the DOM.
+									secretInput?.setValue("");
+									void refreshStatus();
+								} else if ("error" in ev) {
+									new Notice(`Connection failed: ${ev.error}`);
+								}
+							});
+						} catch (e) {
+							new Notice(`Connection failed: ${(e as Error).message}`);
+						} finally {
+							btn.setDisabled(false);
+						}
+					}),
+			);
 
 		const syncSetting = new Setting(containerEl)
 			.setName("Sync now")

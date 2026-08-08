@@ -25,13 +25,11 @@ Everything is local and self-hosted: you supply your own Google OAuth credential
 
 ## Screenshots
 
-> Settings tab — connection status, credentials, Drive folder link, and manual sync.
+<div align="center">
+  <img src="docs/images/settings.png" width="720" alt="Obsynk settings tab showing OAuth credential fields, Drive folder name, and Connect / Sync now buttons">
+</div>
 
-![Obsynk settings tab](docs/images/settings.png)
-
-> Live progress during a full sync, with operation count and percentage.
-
-![Sync in progress](docs/images/sync-progress.png)
+<p align="center"><em>The settings tab: Google OAuth credentials, Drive folder, and manual sync. Once connected it also shows the linked account, last sync time, a direct link to the Drive folder, and live <code>x/y (z%)</code> progress while syncing.</em></p>
 
 ## Features
 
