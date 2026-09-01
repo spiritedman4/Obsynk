@@ -61,14 +61,22 @@ export default class ObsynkPlugin extends Plugin {
 			return;
 		}
 
-		this.registerEvent(this.app.vault.on("modify", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "MODIFY")));
-		this.registerEvent(this.app.vault.on("create", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "CREATE")));
-		this.registerEvent(this.app.vault.on("delete", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "DELETE")));
-		this.registerEvent(
-			this.app.vault.on("rename", (f: TAbstractFile, oldPath: string) =>
-				this.eventQueue.enqueue(f.path, "RENAME", oldPath),
-			),
-		);
+		// Registered only once the workspace is ready. Obsidian replays a
+		// "create" for every existing file while it builds its initial index,
+		// so subscribing during onload enqueues the entire vault as a single
+		// event batch -- a full sync in all but name, which would then run
+		// concurrently with any real sync and duplicate every folder on Drive.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(this.app.vault.on("modify", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "MODIFY")));
+			this.registerEvent(this.app.vault.on("create", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "CREATE")));
+			this.registerEvent(this.app.vault.on("delete", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "DELETE")));
+			this.registerEvent(
+				this.app.vault.on("rename", (f: TAbstractFile, oldPath: string) =>
+					this.eventQueue.enqueue(f.path, "RENAME", oldPath),
+				),
+			);
+			this.logger?.info("Vault watchers registered (post-layout).");
+		});
 	}
 
 	async onunload(): Promise<void> {

@@ -43,6 +43,12 @@ type Server struct {
 	lastSyncUnixMs int64
 
 	stopCh chan struct{}
+
+	// syncSem serializes syncs: capacity 1, held for the whole of one sync
+	// including result streaming. Two syncs must never overlap -- they would
+	// each build their own folderCache, so each would create its own copy of
+	// every directory on Drive, and every file would be uploaded twice.
+	syncSem chan struct{}
 }
 
 // NewServer loads this vault's persisted config and sync manifest, and --
@@ -58,6 +64,7 @@ func NewServer(version, vaultPath string) (*Server, error) {
 		tokenPath:    filepath.Join(dataDir, "token.json"),
 		manifestPath: filepath.Join(dataDir, "sync-state.json"),
 		stopCh:       make(chan struct{}),
+		syncSem:      make(chan struct{}, 1),
 	}
 
 	cfg, err := config.Load(s.configPath)
@@ -117,6 +124,21 @@ func (s *Server) initDrive(ctx context.Context) error {
 			return fmt.Errorf("ensuring drive root folder: %w", err)
 		}
 		rootID = id
+	}
+
+	// A baseline describes an agreement with one specific Drive folder, so
+	// if the configured root has changed it describes files that have
+	// nothing to do with the new one and must not be carried over.
+	switch s.store.AdoptRoot(rootID) {
+	case statestore.RootReset:
+		log.Printf("obsynkd: drive root folder changed to %s; discarded the previous sync baseline so the vault re-uploads into it", rootID)
+		if err := s.store.Save(); err != nil {
+			return fmt.Errorf("saving reset sync state: %w", err)
+		}
+	case statestore.RootRecorded:
+		if err := s.store.Save(); err != nil {
+			return fmt.Errorf("recording drive root in sync state: %w", err)
+		}
 	}
 
 	engine := &syncengine.Engine{
@@ -220,20 +242,44 @@ func (s *Server) SetConfig(ctx context.Context, req *obsynkv1.SetConfigRequest) 
 	if req.GetClientSecret() != "" {
 		s.cfg.ClientSecret = req.GetClientSecret()
 	}
-	if req.GetDriveRootFolderName() != "" {
-		s.cfg.DriveRootFolderName = req.GetDriveRootFolderName()
+	// Changing the folder name has to clear the cached folder ID, or
+	// nothing happens: initDrive only resolves a name to an ID when the ID
+	// is empty, so the daemon would keep syncing into the old folder while
+	// the settings tab showed the new name.
+	rootRenamed := false
+	if name := req.GetDriveRootFolderName(); name != "" && name != s.cfg.DriveRootFolderName {
+		s.cfg.DriveRootFolderName = name
+		s.cfg.DriveRootFolderID = ""
+		rootRenamed = true
 	}
 	cfg := s.cfg
+	connected := s.driveClient != nil
 	s.mu.Unlock()
 
 	if err := cfg.Save(s.configPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "saving config: %v", err)
 	}
 
+	// Re-resolve the root against the new name and rewire the engine.
+	// initDrive discards the sync baseline if this lands on a different
+	// folder, so the vault re-uploads into it rather than carrying over
+	// records describing files in the old one.
+	if rootRenamed && connected {
+		if err := s.initDrive(ctx); err != nil {
+			return nil, status.Errorf(codes.Internal, "switching to drive folder %q: %v", cfg.DriveRootFolderName, err)
+		}
+	}
+
 	return s.GetConfig(ctx, &obsynkv1.GetConfigRequest{})
 }
 
 func (s *Server) SyncPaths(req *obsynkv1.SyncPathsRequest, stream grpc.ServerStreamingServer[obsynkv1.SyncProgress]) error {
+	release, err := s.acquireSync(stream.Context())
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	engine := s.currentEngine()
 	if engine == nil {
 		return status.Error(codes.FailedPrecondition, "drive is not connected yet")
@@ -256,6 +302,12 @@ func (s *Server) SyncPaths(req *obsynkv1.SyncPathsRequest, stream grpc.ServerStr
 }
 
 func (s *Server) FullSync(req *obsynkv1.FullSyncRequest, stream grpc.ServerStreamingServer[obsynkv1.SyncProgress]) error {
+	release, err := s.acquireSync(stream.Context())
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	engine := s.currentEngine()
 	if engine == nil {
 		return status.Error(codes.FailedPrecondition, "drive is not connected yet")
@@ -266,6 +318,18 @@ func (s *Server) FullSync(req *obsynkv1.FullSyncRequest, stream grpc.ServerStrea
 		return status.Errorf(codes.Internal, "full sync failed: %v", err)
 	}
 	return s.streamResults(stream, results, total)
+}
+
+// acquireSync waits for exclusive use of the sync path, returning a release
+// func. It blocks rather than rejecting so a queued vault-event batch is
+// delayed instead of dropped, and gives up if the caller disconnects first.
+func (s *Server) acquireSync(ctx context.Context) (func(), error) {
+	select {
+	case s.syncSem <- struct{}{}:
+		return func() { <-s.syncSem }, nil
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 }
 
 func (s *Server) currentEngine() *syncengine.Engine {

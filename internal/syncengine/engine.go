@@ -67,9 +67,25 @@ func (e *Engine) FullSync(ctx context.Context) (<-chan OpResult, int, error) {
 	}
 
 	baseline := e.Store.Snapshot()
+	if err := guardAgainstEmptyRemote(remote, baseline); err != nil {
+		return nil, 0, err
+	}
+
 	ops := Plan(Diff(local, remote, baseline))
-	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folderIDs, e.Workers)
+	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, e.newFolderCache(folderIDs), e.Workers)
 	return executor.Run(ctx, ops), len(ops), nil
+}
+
+// newFolderCache builds the folder cache for one sync. seed carries
+// directories already read off Drive during this sync (a full tree
+// listing); everything else is resolved on demand, preferring the folder
+// IDs remembered in the statestore over a search.
+func (e *Engine) newFolderCache(seed map[string]string) *folderCache {
+	return newFolderCache(e.DriveRootID, seed, folderDeps{
+		create:  e.Drive.EnsureChildFolder,
+		verify:  e.Drive.VerifyFolder,
+		persist: e.Store,
+	})
 }
 
 // SyncPaths reconciles only the paths implicated by a debounced batch of
@@ -79,10 +95,15 @@ func (e *Engine) FullSync(ctx context.Context) (<-chan OpResult, int, error) {
 // to the generic path-by-path reconciliation (which will see the old path
 // as absent and the new path as untracked, i.e. a fresh create).
 func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpResult, int, error) {
+	// One cache for the whole sync, shared between rename handling and the
+	// executor: a rename into a directory and an upload into that same
+	// directory must agree on which Drive folder it is.
+	folders := e.newFolderCache(nil)
+
 	pathSet := make(map[string]struct{}, len(events))
 	for _, ev := range events {
 		if ev.Kind == EventRename {
-			handled, err := e.handleRename(ctx, ev.OldRelativePath, ev.RelativePath)
+			handled, err := e.handleRename(ctx, folders, ev.OldRelativePath, ev.RelativePath)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -98,7 +119,7 @@ func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpRe
 		relPaths = append(relPaths, p)
 	}
 
-	return e.syncRelPaths(ctx, relPaths)
+	return e.syncRelPaths(ctx, folders, relPaths)
 }
 
 // syncRelPaths scans only the given relative paths locally, and resolves
@@ -114,11 +135,10 @@ func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpRe
 // single-writer personal vault; a full FullSync (or the periodic
 // reconciliation flagged as a future mitigation for remote-only changes)
 // would catch and resolve it.
-func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan OpResult, int, error) {
+func (e *Engine) syncRelPaths(ctx context.Context, folders *folderCache, relPaths []string) (<-chan OpResult, int, error) {
 	local := make(map[string]model.FileMetadata)
 	remote := make(map[string]RemoteEntry)
 	baseline := make(map[string]model.SyncRecord)
-	folderIDs := map[string]string{"": e.DriveRootID}
 
 	for _, relPath := range relPaths {
 		relPath = filepath.ToSlash(relPath)
@@ -174,13 +194,16 @@ func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan Op
 			ModTime:      modTime,
 			ParentID:     parentID,
 		}
-		if parentID != "" {
-			folderIDs[parentOf(relPath)] = parentID
-		}
+		// Deliberately not seeding the folder cache with parentID here. It's
+		// where this file currently sits on Drive, which is only the folder
+		// for parentOf(relPath) as long as nobody has moved the file --
+		// seeding it would send the rest of the batch's uploads wherever a
+		// single moved file happens to live. The folder cache resolves the
+		// directory itself, from IDs recorded for directories.
 	}
 
 	ops := Plan(Diff(local, remote, baseline))
-	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folderIDs, e.Workers)
+	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folders, e.Workers)
 	return executor.Run(ctx, ops), len(ops), nil
 }
 
@@ -188,7 +211,7 @@ func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan Op
 // vault rename event, when the old path's Drive counterpart is already
 // known. Returns handled=false (no error) when there's no baseline to act
 // on, so the caller falls back to generic reconciliation.
-func (e *Engine) handleRename(ctx context.Context, oldRel, newRel string) (handled bool, err error) {
+func (e *Engine) handleRename(ctx context.Context, folders *folderCache, oldRel, newRel string) (handled bool, err error) {
 	oldRel = filepath.ToSlash(oldRel)
 	newRel = filepath.ToSlash(newRel)
 
@@ -197,13 +220,9 @@ func (e *Engine) handleRename(ctx context.Context, oldRel, newRel string) (handl
 		return false, nil
 	}
 
-	newParentID := e.DriveRootID
-	if newParent := parentOf(newRel); newParent != "" {
-		id, ferr := e.Drive.EnsureSubfolders(ctx, e.DriveRootID, newParent)
-		if ferr != nil {
-			return false, fmt.Errorf("syncengine: ensuring folder for rename target %s: %w", newRel, ferr)
-		}
-		newParentID = id
+	newParentID, ferr := folders.resolve(ctx, parentOf(newRel))
+	if ferr != nil {
+		return false, fmt.Errorf("syncengine: ensuring folder for rename target %s: %w", newRel, ferr)
 	}
 
 	newName := stdpath.Base(newRel)
