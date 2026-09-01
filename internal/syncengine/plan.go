@@ -25,8 +25,9 @@ type Operation struct {
 // (nothing to do) and ordering shallower paths before deeper ones so that,
 // e.g., a push into a brand-new subdirectory is ordered after any operation
 // for a shallower path that might create part of that directory structure.
-// Folder creation itself is idempotent (internal/drive.EnsureSubfolders), so
-// this ordering is about predictability, not correctness.
+// Ordering is about predictability, not correctness: ops run concurrently,
+// so it guarantees nothing about which directory exists when. Making
+// directory creation safe under that concurrency is folderCache's job.
 func Plan(results []DiffResult) []Operation {
 	ops := make([]Operation, 0, len(results))
 	for _, r := range results {

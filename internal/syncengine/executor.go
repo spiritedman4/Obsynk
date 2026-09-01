@@ -33,17 +33,14 @@ type Executor struct {
 	rootID    string
 	workers   int
 
-	folderMu  sync.Mutex
-	folderIDs map[string]string // relative dir path ("" = root) -> Drive folder ID
+	folders *folderCache
 }
 
-// NewExecutor builds an Executor. folderIDs may be nil or pre-seeded (e.g.
-// from a prior full Drive tree listing) to avoid redundant EnsureSubfolders
-// calls for directories already known.
-func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot, rootID string, folderIDs map[string]string, workers int) *Executor {
-	if folderIDs == nil {
-		folderIDs = make(map[string]string)
-	}
+// NewExecutor builds an Executor. folders is the sync's folder cache, built
+// by the Engine and shared with anything else in the same sync that has to
+// resolve a directory (rename handling), so one directory is resolved once
+// per sync however many code paths need it.
+func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot, rootID string, folders *folderCache, workers int) *Executor {
 	if workers <= 0 {
 		workers = 4
 	}
@@ -53,7 +50,7 @@ func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot, 
 		vaultRoot: vaultRoot,
 		rootID:    rootID,
 		workers:   workers,
-		folderIDs: folderIDs,
+		folders:   folders,
 	}
 }
 
@@ -238,26 +235,14 @@ func (e *Executor) pullDelete(_ context.Context, op Operation) error {
 }
 
 // ensureParentFolder resolves (creating if needed) the Drive folder for
-// relPath's parent directory, caching the result for the lifetime of this
-// Executor so files landing in the same new directory within one batch
-// don't repeat the lookup/creation.
+// relPath's parent directory. The folderCache resolves each directory
+// exactly once for the lifetime of this Executor, so workers pushing into
+// the same new directory share one creation instead of racing to make
+// duplicates of it.
 func (e *Executor) ensureParentFolder(ctx context.Context, relPath string) (string, error) {
-	dir := parentOf(relPath)
-
-	e.folderMu.Lock()
-	if id, ok := e.folderIDs[dir]; ok {
-		e.folderMu.Unlock()
-		return id, nil
-	}
-	e.folderMu.Unlock()
-
-	id, err := e.drive.EnsureSubfolders(ctx, e.rootID, dir)
+	id, err := e.folders.resolve(ctx, parentOf(relPath))
 	if err != nil {
 		return "", fmt.Errorf("syncengine: ensuring folder for %s: %w", relPath, err)
 	}
-
-	e.folderMu.Lock()
-	e.folderIDs[dir] = id
-	e.folderMu.Unlock()
 	return id, nil
 }

@@ -36,7 +36,10 @@ type SyncRecord struct {
 
 // ManifestVersion is bumped whenever the on-disk Manifest schema changes in
 // a way that requires migration.
-const ManifestVersion = 1
+//
+// v2 added Folders. v1 manifests migrate forward by simply starting with an
+// empty map, which refills itself as folders are resolved.
+const ManifestVersion = 2
 
 // Manifest is the full persisted sync state for one vault.
 type Manifest struct {
@@ -44,6 +47,23 @@ type Manifest struct {
 	VaultPath   string                `json:"vaultPath"`
 	DriveRootID string                `json:"driveRootId"`
 	Records     map[string]SyncRecord `json:"records"` // key = RelativePath
+
+	// Folders maps a vault-relative directory path (forward slashes, no
+	// leading or trailing slash; the root is not stored) to its Drive
+	// folder ID.
+	//
+	// Kept separately from Records rather than derived from their
+	// DriveParentID because resolving a directory must not depend on a file
+	// living in it: directories are created before their first file lands,
+	// and may be empty. Persisting these lets a sync address a folder by ID
+	// instead of searching for it by name -- Drive's search index is
+	// eventually consistent, so a folder created moments earlier can still
+	// be missing from a search and get created a second time.
+	//
+	// Entries can go stale (the folder trashed or moved on Drive), so a
+	// stored ID is verified before it's trusted; see syncengine's
+	// folderCache.
+	Folders map[string]string `json:"folders"`
 }
 
 // NewManifest returns an empty Manifest for vaultPath, ready to have
@@ -53,5 +73,6 @@ func NewManifest(vaultPath string) Manifest {
 		Version:   ManifestVersion,
 		VaultPath: vaultPath,
 		Records:   make(map[string]SyncRecord),
+		Folders:   make(map[string]string),
 	}
 }
