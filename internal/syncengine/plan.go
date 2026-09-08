@@ -19,6 +19,10 @@ type Operation struct {
 
 	// Winner is "local" or "remote", set only when Kind == DecisionConflict.
 	Winner string
+
+	// OldRelativePath is the file's current location on disk, set only when
+	// Kind == DecisionMoveLocal.
+	OldRelativePath string
 }
 
 // Plan converts DiffResults into Operations, dropping DecisionNone entries
@@ -35,12 +39,13 @@ func Plan(results []DiffResult) []Operation {
 			continue
 		}
 		ops = append(ops, Operation{
-			Kind:         r.Decision,
-			RelativePath: r.RelativePath,
-			Local:        r.Local,
-			Remote:       r.Remote,
-			Baseline:     r.Baseline,
-			Winner:       r.Winner,
+			Kind:            r.Decision,
+			RelativePath:    r.RelativePath,
+			Local:           r.Local,
+			Remote:          r.Remote,
+			Baseline:        r.Baseline,
+			Winner:          r.Winner,
+			OldRelativePath: r.OldRelativePath,
 		})
 	}
 
