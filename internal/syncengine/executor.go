@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"context"
@@ -106,6 +107,8 @@ func (e *Executor) execute(ctx context.Context, op Operation) error {
 		return e.pushDelete(ctx, op)
 	case DecisionPullDelete:
 		return e.pullDelete(ctx, op)
+	case DecisionMoveLocal:
+		return e.moveLocal(op)
 	case DecisionConflict:
 		if op.Winner == "remote" {
 			return e.pull(ctx, op)
@@ -231,7 +234,64 @@ func (e *Executor) pullDelete(_ context.Context, op Operation) error {
 		return fmt.Errorf("syncengine: pull-deleting %s: %w", op.RelativePath, err)
 	}
 	e.store.Delete(op.RelativePath)
+	pruneEmptyDirs(e.vaultRoot, filepath.Dir(absPath))
 	return nil
+}
+
+// moveLocal relocates a file whose Drive counterpart moved, rather than
+// deleting it here and downloading it again there. The content is already on
+// disk and byte-identical, so a rename is both cheaper and safer: it never
+// leaves the old path without a baseline record, which is what let a stale
+// copy be re-uploaded and the move undone.
+func (e *Executor) moveLocal(op Operation) error {
+	if op.Remote == nil || op.Baseline == nil || op.OldRelativePath == "" {
+		return fmt.Errorf("syncengine: move %s: incomplete move metadata", op.RelativePath)
+	}
+
+	oldAbs := filepath.Join(e.vaultRoot, filepath.FromSlash(op.OldRelativePath))
+	newAbs := filepath.Join(e.vaultRoot, filepath.FromSlash(op.RelativePath))
+
+	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+		return fmt.Errorf("syncengine: creating local dir for %s: %w", op.RelativePath, err)
+	}
+	if err := os.Rename(oldAbs, newAbs); err != nil {
+		return fmt.Errorf("syncengine: moving %s -> %s: %w", op.OldRelativePath, op.RelativePath, err)
+	}
+
+	rec := *op.Baseline
+	rec.RelativePath = op.RelativePath
+	rec.DriveFileID = op.Remote.FileID
+	rec.DriveMD5 = op.Remote.MD5
+	rec.DriveModTime = op.Remote.ModTime
+	rec.DriveParentID = op.Remote.ParentID
+
+	e.store.Delete(op.OldRelativePath)
+	e.store.Set(rec)
+
+	pruneEmptyDirs(e.vaultRoot, filepath.Dir(oldAbs))
+	return nil
+}
+
+// pruneEmptyDirs removes dir and any parents it empties, stopping at the
+// vault root. A move or a remote deletion otherwise leaves the emptied
+// directory behind forever -- nothing else ever removes one, since the
+// engine tracks files and not directories.
+func pruneEmptyDirs(vaultRoot, dir string) {
+	root := filepath.Clean(vaultRoot)
+	for {
+		dir = filepath.Clean(dir)
+		if dir == root || !strings.HasPrefix(dir, root+string(filepath.Separator)) {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // ensureParentFolder resolves (creating if needed) the Drive folder for

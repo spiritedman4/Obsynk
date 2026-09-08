@@ -32,6 +32,14 @@ const (
 	// DecisionCreateRemote uploads a file that exists locally but was never
 	// synced before and has no Drive copy.
 	DecisionCreateRemote
+	// DecisionMoveLocal relocates a local file whose Drive counterpart moved
+	// to a different path since the last sync, identified by Drive file ID.
+	// Without this a move arrives as a delete at the old path plus a create
+	// at the new one, which re-downloads content that is already on disk and,
+	// worse, leaves the old path with no baseline record -- so a machine that
+	// still holds the file there re-uploads it and resurrects the move's
+	// source on Drive.
+	DecisionMoveLocal
 )
 
 func (d Decision) String() string {
@@ -52,6 +60,8 @@ func (d Decision) String() string {
 		return "create_local"
 	case DecisionCreateRemote:
 		return "create_remote"
+	case DecisionMoveLocal:
+		return "move_local"
 	default:
 		return "unknown"
 	}
@@ -83,6 +93,11 @@ type DiffResult struct {
 	// Winner is "local" or "remote", set only when Decision ==
 	// DecisionConflict.
 	Winner string
+
+	// OldRelativePath is where the file currently sits locally, set only
+	// when Decision == DecisionMoveLocal. Local and Baseline describe that
+	// old path; RelativePath and Remote describe where it belongs now.
+	OldRelativePath string
 }
 
 // Diff compares the current local scan, the current Drive listing, and the
@@ -101,8 +116,36 @@ func Diff(local map[string]model.FileMetadata, remote map[string]RemoteEntry, ba
 		paths[p] = struct{}{}
 	}
 
+	// Moves are resolved before anything else: both endpoints of a move are
+	// in paths, and each would otherwise be judged on its own as a deletion
+	// and an unrelated creation.
+	movedTo := detectMoves(local, remote, baseline)
+	movedFrom := make(map[string]struct{}, len(movedTo))
+	for _, old := range movedTo {
+		movedFrom[old] = struct{}{}
+	}
+
 	results := make([]DiffResult, 0, len(paths))
 	for p := range paths {
+		if _, isSource := movedFrom[p]; isSource {
+			// Consumed by the move emitted at its destination.
+			continue
+		}
+		if oldPath, moved := movedTo[p]; moved {
+			oldLocal := local[oldPath]
+			oldBaseline := baseline[oldPath]
+			newRemote := remote[p]
+			results = append(results, DiffResult{
+				RelativePath:    p,
+				OldRelativePath: oldPath,
+				Decision:        DecisionMoveLocal,
+				Local:           &oldLocal,
+				Remote:          &newRemote,
+				Baseline:        &oldBaseline,
+			})
+			continue
+		}
+
 		l, hasLocal := local[p]
 		r, hasRemote := remote[p]
 		b, hasBaseline := baseline[p]
@@ -189,4 +232,50 @@ func resolveWinner(localTime, remoteTime time.Time) string {
 		return "remote"
 	}
 	return "local"
+}
+
+// detectMoves finds files that moved on Drive since the last sync, returning
+// newPath -> oldPath. Matching is by Drive file ID: it is the only identity
+// that survives a move, since local hashes are sha256 and Drive reports md5,
+// so content cannot be compared across the boundary.
+//
+// Only unambiguous moves qualify. The destination must be untracked and
+// unoccupied locally, the source must still be on disk, and the content must
+// be unchanged on both sides -- anything else is a move tangled up with an
+// edit, and is left to the ordinary per-path rules, which are conservative
+// and will not lose data.
+func detectMoves(local map[string]model.FileMetadata, remote map[string]RemoteEntry, baseline map[string]model.SyncRecord) map[string]string {
+	byFileID := make(map[string]string, len(baseline))
+	for path, rec := range baseline {
+		if rec.DriveFileID != "" && !rec.Deleted {
+			byFileID[rec.DriveFileID] = path
+		}
+	}
+
+	moves := make(map[string]string)
+	for newPath, r := range remote {
+		if r.FileID == "" {
+			continue
+		}
+		oldPath, known := byFileID[r.FileID]
+		if !known || oldPath == newPath {
+			continue
+		}
+		if _, tracked := baseline[newPath]; tracked {
+			continue
+		}
+		if _, occupied := local[newPath]; occupied {
+			continue
+		}
+		oldLocal, present := local[oldPath]
+		if !present {
+			continue
+		}
+		oldBaseline := baseline[oldPath]
+		if oldLocal.Hash != oldBaseline.LocalHash || r.MD5 != oldBaseline.DriveMD5 {
+			continue
+		}
+		moves[newPath] = oldPath
+	}
+	return moves
 }
