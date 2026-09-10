@@ -1,0 +1,1952 @@
+From 518b5e345307f571c2f8633b8ee642edabab99dd Mon Sep 17 00:00:00 2001
+From: spiritedman4 <sivamsrini214@gmail.com>
+Date: Tue, 1 Sep 2026 20:29:12 +0530
+Subject: [PATCH] Fix duplicate Drive folders and the races behind them
+
+A first sync left three or four copies of every folder on Drive, with the
+vault's files scattered across them. There were four distinct defects, each
+independently sufficient to cause it.
+
+Folder resolution raced within a sync. ensureParentFolder dropped its lock
+across the network call, so N workers pushing into the same missing
+directory all saw an empty list and all created it. New folderCache resolves
+each directory exactly once via per-path single-flight, publishing the entry
+before the call. Entries are per path component, so siblings still resolve
+concurrently while sharing one resolution of their ancestor.
+
+Folder resolution raced across syncs. Drive's files.list is backed by an
+eventually consistent search index, so a folder created moments earlier can
+be missing from the next sync's lookup and created again. Manifest now
+persists a dir -> folder ID map (schema v2, migrated from v1 by starting
+empty). A remembered ID is verified by files.get, which is strongly
+consistent, before reuse; stale mappings (trashed, moved, gone) are dropped
+and recreated. A failed verification fails the operation rather than
+guessing "absent" -- guessing is what creates duplicates.
+
+Syncs could overlap. A manual sync and a vault-event batch ran together,
+each with its own folderCache, so each created its own copy of every
+directory and every file was uploaded twice. Sync RPCs now serialize on a
+capacity-1 semaphore held across result streaming, blocking rather than
+rejecting so a queued batch is delayed instead of dropped.
+
+Plugin startup enqueued the whole vault. Obsidian replays a create event for
+every existing file while building its initial index, and watchers were
+registered in onload, turning startup into a full sync that then ran
+alongside any real one. Watchers now register inside onLayoutReady.
+
+Also fixes two hazards found while tracing the above:
+
+Repointing the Drive root silently stranded the baseline. Records describe
+an agreement with one specific folder tree; against a different root they
+describe files that have nothing to do with it, so pushes kept updating the
+old folder's files in place while a full sync read the new folder's
+emptiness as a wholesale remote deletion. The manifest now records its root
+and discards the baseline when it changes. An unrecorded root is adopted
+rather than treated as a change, so existing vaults are not wiped on
+upgrade.
+
+Changing the root folder name did nothing. SetConfig saved the name but kept
+the cached ID, and initDrive only resolves a name when the ID is empty, so
+the daemon kept syncing into the old folder. It now clears the ID on a real
+name change and re-resolves.
+
+Adds a guard refusing a full sync whose Drive listing is empty while the
+baseline says files should exist -- an empty listing means the root was
+repointed, trashed, or access was revoked far more often than it means the
+user deleted everything, and acting on it deletes the local vault.
+
+EnsureSubfolders is removed: unused after this, and unsafe by construction.
+
+Known gaps, unaddressed here: push still trusts baseline.DriveFileID without
+checking the file is live and in the expected parent, so UpdateContent can
+write into a trashed or duplicate folder and report success; and there is no
+guard for the mirror case of an empty local scan against a full baseline.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/drive/folder.go                      |  86 ++-
+ internal/grpcserver/server.go                 |  68 ++-
+ .../grpcserver/sync_serialization_test.go     | 119 +++++
+ internal/model/manifest.go                    |  23 +-
+ internal/statestore/store.go                  | 110 +++-
+ internal/statestore/store_test.go             | 182 +++++++
+ internal/syncengine/emptyremote.go            |  62 +++
+ internal/syncengine/emptyremote_test.go       |  75 +++
+ internal/syncengine/engine.go                 |  53 +-
+ internal/syncengine/executor.go               |  39 +-
+ internal/syncengine/foldercache.go            | 197 +++++++
+ internal/syncengine/foldercache_test.go       | 503 ++++++++++++++++++
+ internal/syncengine/plan.go                   |   5 +-
+ plugin/src/main.ts                            |  24 +-
+ 14 files changed, 1464 insertions(+), 82 deletions(-)
+ create mode 100644 internal/grpcserver/sync_serialization_test.go
+ create mode 100644 internal/syncengine/emptyremote.go
+ create mode 100644 internal/syncengine/emptyremote_test.go
+ create mode 100644 internal/syncengine/foldercache.go
+ create mode 100644 internal/syncengine/foldercache_test.go
+
+diff --git a/internal/drive/folder.go b/internal/drive/folder.go
+index 88686a1..d51f0d2 100644
+--- a/internal/drive/folder.go
++++ b/internal/drive/folder.go
+@@ -2,47 +2,87 @@ package drive
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"strings"
+ 
+ 	drivev3 "google.golang.org/api/drive/v3"
++	"google.golang.org/api/googleapi"
+ )
+ 
++// folderMimeType is the mime type Drive gives folders.
++const folderMimeType = "application/vnd.google-apps.folder"
++
+ // EnsureRootFolder finds (by name + parent) or creates the vault's
+ // dedicated Drive folder, returning its file ID. Idempotent: safe to call
+ // on every daemon start. parentID may be empty to search/create under
+ // Drive's root ("My Drive").
+ func (c *Client) EnsureRootFolder(ctx context.Context, name, parentID string) (string, error) {
+-	return c.ensureFolder(ctx, name, parentID)
++	return c.EnsureChildFolder(ctx, parentID, name)
+ }
+ 
+-// EnsureSubfolders creates any intermediate folder path components
+-// mirroring dirRelPath under rootID (idempotent, caching nothing across
+-// calls -- callers doing many files in the same directory should cache the
+-// result themselves), returning the leaf folder's ID. An empty or "."
+-// dirRelPath returns rootID unchanged.
+-func (c *Client) EnsureSubfolders(ctx context.Context, rootID, dirRelPath string) (string, error) {
+-	dirRelPath = strings.Trim(dirRelPath, "/")
+-	if dirRelPath == "" || dirRelPath == "." {
+-		return rootID, nil
++// VerifyFolder reports whether folderID still names a live folder sitting
++// directly under parentID, which is how a remembered folder ID is checked
++// before it's reused across syncs. An empty parentID skips the parent
++// check.
++//
++// This is a files.get by ID, which -- unlike the files.list search that
++// EnsureChildFolder falls back on -- is strongly consistent, so it never
++// reports a folder missing merely because Drive's index hasn't caught up.
++//
++// A folder that's gone (404), trashed, moved elsewhere, or no longer a
++// folder returns false with a nil error: the ID is stale, not broken, and
++// the caller should fall back to find-or-create. A genuine API failure
++// returns an error, so callers don't mistake "couldn't check" for "isn't
++// there" and create a duplicate.
++func (c *Client) VerifyFolder(ctx context.Context, folderID, parentID string) (bool, error) {
++	f, err := withRetry(ctx, func() (*drivev3.File, error) {
++		return c.svc.Files.Get(folderID).
++			Fields("id, mimeType, trashed, parents").
++			Context(ctx).
++			Do()
++	})
++	if err != nil {
++		var apiErr *googleapi.Error
++		if errors.As(err, &apiErr) && (apiErr.Code == 404 || apiErr.Code == 403) {
++			// 403 here means the folder still exists but this account can no
++			// longer reach it -- unusable either way, same as gone.
++			return false, nil
++		}
++		return false, fmt.Errorf("drive: verifying folder %s: %w", folderID, err)
+ 	}
+ 
+-	current := rootID
+-	for _, part := range strings.Split(dirRelPath, "/") {
+-		if part == "" {
+-			continue
+-		}
+-		id, err := c.ensureFolder(ctx, part, current)
+-		if err != nil {
+-			return "", err
++	if f.Trashed || f.MimeType != folderMimeType {
++		return false, nil
++	}
++	if parentID == "" {
++		return true, nil
++	}
++	for _, p := range f.Parents {
++		if p == parentID {
++			return true, nil
+ 		}
+-		current = id
+ 	}
+-	return current, nil
++	return false, nil
+ }
+ 
+-func (c *Client) ensureFolder(ctx context.Context, name, parentID string) (string, error) {
+-	query := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and trashed = false", escapeQueryValue(name))
++// EnsureChildFolder finds (by exact name) or creates a single folder named
++// name directly under parentID, returning its file ID. parentID may be
++// empty to search/create under Drive's root ("My Drive").
++//
++// Two caveats, both handled by syncengine's folderCache, which is what
++// callers inside a sync should go through:
++//
++// It is only idempotent against itself when called serially. Find-or-create
++// is a list-then-create round trip, so two concurrent calls for the same
++// missing folder both see an empty list and both create it.
++//
++// The lookup half is a files.list search, and Drive's search index is
++// eventually consistent, so a folder created moments ago may not be found
++// and will be created again. Addressing a known folder by ID (VerifyFolder)
++// is not subject to that.
++func (c *Client) EnsureChildFolder(ctx context.Context, parentID, name string) (string, error) {
++	query := fmt.Sprintf("name = '%s' and mimeType = '%s' and trashed = false", escapeQueryValue(name), folderMimeType)
+ 	if parentID != "" {
+ 		query += fmt.Sprintf(" and '%s' in parents", parentID)
+ 	}
+@@ -64,7 +104,7 @@ func (c *Client) ensureFolder(ctx context.Context, name, parentID string) (strin
+ 
+ 	f := &drivev3.File{
+ 		Name:     name,
+-		MimeType: "application/vnd.google-apps.folder",
++		MimeType: folderMimeType,
+ 	}
+ 	if parentID != "" {
+ 		f.Parents = []string{parentID}
+diff --git a/internal/grpcserver/server.go b/internal/grpcserver/server.go
+index 8c145fe..f26a3a6 100644
+--- a/internal/grpcserver/server.go
++++ b/internal/grpcserver/server.go
+@@ -43,6 +43,12 @@ type Server struct {
+ 	lastSyncUnixMs int64
+ 
+ 	stopCh chan struct{}
++
++	// syncSem serializes syncs: capacity 1, held for the whole of one sync
++	// including result streaming. Two syncs must never overlap -- they would
++	// each build their own folderCache, so each would create its own copy of
++	// every directory on Drive, and every file would be uploaded twice.
++	syncSem chan struct{}
+ }
+ 
+ // NewServer loads this vault's persisted config and sync manifest, and --
+@@ -58,6 +64,7 @@ func NewServer(version, vaultPath string) (*Server, error) {
+ 		tokenPath:    filepath.Join(dataDir, "token.json"),
+ 		manifestPath: filepath.Join(dataDir, "sync-state.json"),
+ 		stopCh:       make(chan struct{}),
++		syncSem:      make(chan struct{}, 1),
+ 	}
+ 
+ 	cfg, err := config.Load(s.configPath)
+@@ -119,6 +126,21 @@ func (s *Server) initDrive(ctx context.Context) error {
+ 		rootID = id
+ 	}
+ 
++	// A baseline describes an agreement with one specific Drive folder, so
++	// if the configured root has changed it describes files that have
++	// nothing to do with the new one and must not be carried over.
++	switch s.store.AdoptRoot(rootID) {
++	case statestore.RootReset:
++		log.Printf("obsynkd: drive root folder changed to %s; discarded the previous sync baseline so the vault re-uploads into it", rootID)
++		if err := s.store.Save(); err != nil {
++			return fmt.Errorf("saving reset sync state: %w", err)
++		}
++	case statestore.RootRecorded:
++		if err := s.store.Save(); err != nil {
++			return fmt.Errorf("recording drive root in sync state: %w", err)
++		}
++	}
++
+ 	engine := &syncengine.Engine{
+ 		VaultRoot:   s.vaultPath,
+ 		DriveRootID: rootID,
+@@ -220,20 +242,44 @@ func (s *Server) SetConfig(ctx context.Context, req *obsynkv1.SetConfigRequest)
+ 	if req.GetClientSecret() != "" {
+ 		s.cfg.ClientSecret = req.GetClientSecret()
+ 	}
+-	if req.GetDriveRootFolderName() != "" {
+-		s.cfg.DriveRootFolderName = req.GetDriveRootFolderName()
++	// Changing the folder name has to clear the cached folder ID, or
++	// nothing happens: initDrive only resolves a name to an ID when the ID
++	// is empty, so the daemon would keep syncing into the old folder while
++	// the settings tab showed the new name.
++	rootRenamed := false
++	if name := req.GetDriveRootFolderName(); name != "" && name != s.cfg.DriveRootFolderName {
++		s.cfg.DriveRootFolderName = name
++		s.cfg.DriveRootFolderID = ""
++		rootRenamed = true
+ 	}
+ 	cfg := s.cfg
++	connected := s.driveClient != nil
+ 	s.mu.Unlock()
+ 
+ 	if err := cfg.Save(s.configPath); err != nil {
+ 		return nil, status.Errorf(codes.Internal, "saving config: %v", err)
+ 	}
+ 
++	// Re-resolve the root against the new name and rewire the engine.
++	// initDrive discards the sync baseline if this lands on a different
++	// folder, so the vault re-uploads into it rather than carrying over
++	// records describing files in the old one.
++	if rootRenamed && connected {
++		if err := s.initDrive(ctx); err != nil {
++			return nil, status.Errorf(codes.Internal, "switching to drive folder %q: %v", cfg.DriveRootFolderName, err)
++		}
++	}
++
+ 	return s.GetConfig(ctx, &obsynkv1.GetConfigRequest{})
+ }
+ 
+ func (s *Server) SyncPaths(req *obsynkv1.SyncPathsRequest, stream grpc.ServerStreamingServer[obsynkv1.SyncProgress]) error {
++	release, err := s.acquireSync(stream.Context())
++	if err != nil {
++		return err
++	}
++	defer release()
++
+ 	engine := s.currentEngine()
+ 	if engine == nil {
+ 		return status.Error(codes.FailedPrecondition, "drive is not connected yet")
+@@ -256,6 +302,12 @@ func (s *Server) SyncPaths(req *obsynkv1.SyncPathsRequest, stream grpc.ServerStr
+ }
+ 
+ func (s *Server) FullSync(req *obsynkv1.FullSyncRequest, stream grpc.ServerStreamingServer[obsynkv1.SyncProgress]) error {
++	release, err := s.acquireSync(stream.Context())
++	if err != nil {
++		return err
++	}
++	defer release()
++
+ 	engine := s.currentEngine()
+ 	if engine == nil {
+ 		return status.Error(codes.FailedPrecondition, "drive is not connected yet")
+@@ -268,6 +320,18 @@ func (s *Server) FullSync(req *obsynkv1.FullSyncRequest, stream grpc.ServerStrea
+ 	return s.streamResults(stream, results, total)
+ }
+ 
++// acquireSync waits for exclusive use of the sync path, returning a release
++// func. It blocks rather than rejecting so a queued vault-event batch is
++// delayed instead of dropped, and gives up if the caller disconnects first.
++func (s *Server) acquireSync(ctx context.Context) (func(), error) {
++	select {
++	case s.syncSem <- struct{}{}:
++		return func() { <-s.syncSem }, nil
++	case <-ctx.Done():
++		return nil, status.FromContextError(ctx.Err()).Err()
++	}
++}
++
+ func (s *Server) currentEngine() *syncengine.Engine {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+diff --git a/internal/grpcserver/sync_serialization_test.go b/internal/grpcserver/sync_serialization_test.go
+new file mode 100644
+index 0000000..73423c4
+--- /dev/null
++++ b/internal/grpcserver/sync_serialization_test.go
+@@ -0,0 +1,119 @@
++package grpcserver
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++)
++
++func newTestServer() *Server {
++	return &Server{syncSem: make(chan struct{}, 1)}
++}
++
++// Two syncs overlapping is what left duplicate folders on Drive: each built
++// its own folderCache, so each created its own copy of every directory, and
++// every file was uploaded twice.
++func TestAcquireSyncSerializesOverlappingSyncs(t *testing.T) {
++	t.Parallel()
++
++	s := newTestServer()
++	ctx := context.Background()
++
++	var mu sync.Mutex
++	inFlight, maxInFlight := 0, 0
++
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			release, err := s.acquireSync(ctx)
++			if err != nil {
++				t.Errorf("acquireSync: %v", err)
++				return
++			}
++			defer release()
++
++			mu.Lock()
++			inFlight++
++			if inFlight > maxInFlight {
++				maxInFlight = inFlight
++			}
++			mu.Unlock()
++
++			time.Sleep(2 * time.Millisecond)
++
++			mu.Lock()
++			inFlight--
++			mu.Unlock()
++		}()
++	}
++	wg.Wait()
++
++	if maxInFlight != 1 {
++		t.Errorf("%d syncs ran concurrently, want 1", maxInFlight)
++	}
++}
++
++// A queued batch waits rather than being dropped, so no vault change is lost.
++func TestAcquireSyncBlocksUntilReleased(t *testing.T) {
++	t.Parallel()
++
++	s := newTestServer()
++	release, err := s.acquireSync(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	got := make(chan struct{})
++	go func() {
++		r, err := s.acquireSync(context.Background())
++		if err == nil {
++			r()
++		}
++		close(got)
++	}()
++
++	select {
++	case <-got:
++		t.Fatal("second sync started while the first still held the lock")
++	case <-time.After(50 * time.Millisecond):
++	}
++
++	release()
++	select {
++	case <-got:
++	case <-time.After(2 * time.Second):
++		t.Error("second sync never acquired after release")
++	}
++}
++
++// A client that disconnects while waiting must not leave the sync path held.
++func TestAcquireSyncHonorsCallerCancellation(t *testing.T) {
++	t.Parallel()
++
++	s := newTestServer()
++	release, err := s.acquireSync(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer release()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() {
++		_, err := s.acquireSync(ctx)
++		done <- err
++	}()
++
++	cancel()
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Error("a cancelled waiter reported success")
++		}
++	case <-time.After(2 * time.Second):
++		t.Error("a cancelled waiter blocked forever")
++	}
++}
+diff --git a/internal/model/manifest.go b/internal/model/manifest.go
+index 2c6a52f..da8b30b 100644
+--- a/internal/model/manifest.go
++++ b/internal/model/manifest.go
+@@ -36,7 +36,10 @@ type SyncRecord struct {
+ 
+ // ManifestVersion is bumped whenever the on-disk Manifest schema changes in
+ // a way that requires migration.
+-const ManifestVersion = 1
++//
++// v2 added Folders. v1 manifests migrate forward by simply starting with an
++// empty map, which refills itself as folders are resolved.
++const ManifestVersion = 2
+ 
+ // Manifest is the full persisted sync state for one vault.
+ type Manifest struct {
+@@ -44,6 +47,23 @@ type Manifest struct {
+ 	VaultPath   string                `json:"vaultPath"`
+ 	DriveRootID string                `json:"driveRootId"`
+ 	Records     map[string]SyncRecord `json:"records"` // key = RelativePath
++
++	// Folders maps a vault-relative directory path (forward slashes, no
++	// leading or trailing slash; the root is not stored) to its Drive
++	// folder ID.
++	//
++	// Kept separately from Records rather than derived from their
++	// DriveParentID because resolving a directory must not depend on a file
++	// living in it: directories are created before their first file lands,
++	// and may be empty. Persisting these lets a sync address a folder by ID
++	// instead of searching for it by name -- Drive's search index is
++	// eventually consistent, so a folder created moments earlier can still
++	// be missing from a search and get created a second time.
++	//
++	// Entries can go stale (the folder trashed or moved on Drive), so a
++	// stored ID is verified before it's trusted; see syncengine's
++	// folderCache.
++	Folders map[string]string `json:"folders"`
+ }
+ 
+ // NewManifest returns an empty Manifest for vaultPath, ready to have
+@@ -53,5 +73,6 @@ func NewManifest(vaultPath string) Manifest {
+ 		Version:   ManifestVersion,
+ 		VaultPath: vaultPath,
+ 		Records:   make(map[string]SyncRecord),
++		Folders:   make(map[string]string),
+ 	}
+ }
+diff --git a/internal/statestore/store.go b/internal/statestore/store.go
+index fe8ed83..8bb87cc 100644
+--- a/internal/statestore/store.go
++++ b/internal/statestore/store.go
+@@ -10,6 +10,7 @@ package statestore
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
+ 	"os"
+ 	"sync"
+ 
+@@ -40,13 +41,33 @@ func Open(path, vaultPath string) (*Store, error) {
+ 	if err := json.Unmarshal(data, &m); err != nil {
+ 		return nil, err
+ 	}
+-	if m.Records == nil {
+-		m.Records = make(map[string]model.SyncRecord)
++	if err := migrate(&m); err != nil {
++		return nil, err
+ 	}
+ 	s.manifest = m
+ 	return s, nil
+ }
+ 
++// migrate brings a manifest loaded from disk up to ManifestVersion. It
++// refuses one written by a newer daemon rather than silently dropping
++// fields it doesn't know about when it saves the file back.
++func migrate(m *model.Manifest) error {
++	if m.Version > model.ManifestVersion {
++		return fmt.Errorf("statestore: manifest version %d was written by a newer version of obsynk (this build understands %d)", m.Version, model.ManifestVersion)
++	}
++	if m.Records == nil {
++		m.Records = make(map[string]model.SyncRecord)
++	}
++	// v1 -> v2: Folders is new, and starts empty. Nothing is lost -- an
++	// unknown directory is resolved by search on first use, exactly as
++	// before, and remembered from then on.
++	if m.Folders == nil {
++		m.Folders = make(map[string]string)
++	}
++	m.Version = model.ManifestVersion
++	return nil
++}
++
+ func (s *Store) Get(relPath string) (model.SyncRecord, bool) {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+@@ -78,6 +99,34 @@ func (s *Store) Snapshot() map[string]model.SyncRecord {
+ 	return out
+ }
+ 
++// FolderID returns the remembered Drive folder ID for a vault-relative
++// directory path. The caller must verify it's still live before trusting
++// it -- the folder may have been trashed or moved on Drive since.
++func (s *Store) FolderID(dir string) (string, bool) {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	id, ok := s.manifest.Folders[dir]
++	return id, ok
++}
++
++// SetFolder remembers dir's Drive folder ID for later syncs.
++func (s *Store) SetFolder(dir, id string) {
++	if dir == "" || id == "" {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.manifest.Folders[dir] = id
++}
++
++// DeleteFolder forgets dir's remembered folder ID, called when the stored
++// ID turns out to be stale.
++func (s *Store) DeleteFolder(dir string) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	delete(s.manifest.Folders, dir)
++}
++
+ // Save persists the current manifest atomically.
+ func (s *Store) Save() error {
+ 	s.mu.RLock()
+@@ -88,3 +137,60 @@ func (s *Store) Save() error {
+ 	}
+ 	return atomicWriteFile(s.path, data, 0o600)
+ }
++
++// RootAdoption is the outcome of reconciling a manifest against the Drive
++// root folder the daemon is configured to sync with.
++type RootAdoption int
++
++const (
++	// RootUnchanged means the manifest already describes this root.
++	RootUnchanged RootAdoption = iota
++	// RootRecorded means the manifest had no root recorded and has now
++	// adopted this one, keeping its records. This is the first run, or a
++	// manifest written before the root was tracked.
++	RootRecorded
++	// RootReset means the manifest described a different root, so its
++	// baseline was discarded.
++	RootReset
++)
++
++// AdoptRoot reconciles the manifest with the Drive root folder the daemon
++// is configured to use, discarding the baseline if it describes a different
++// folder.
++//
++// A baseline record is not a description of the vault; it's a description
++// of an agreement between the vault and one specific Drive folder tree
++// ("note.md matched Drive file X in parent Y"). Point the daemon at a
++// different root and every one of those claims is about files that have
++// nothing to do with the new folder -- pushes would keep updating the old
++// folder's files in place, and a full sync would read the new folder's
++// emptiness as "everything was deleted on Drive" and delete the local vault
++// to match. Dropping the baseline instead makes the next sync treat every
++// path as new and upload it into the new root.
++//
++// An empty recorded root is adopted rather than treated as a change: it
++// means "not tracked yet", which is what every manifest written before this
++// was tracked looks like, and wiping those would be destructive on upgrade.
++//
++// The caller must Save to persist the outcome.
++func (s *Store) AdoptRoot(rootID string) RootAdoption {
++	if rootID == "" {
++		return RootUnchanged
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	switch s.manifest.DriveRootID {
++	case rootID:
++		return RootUnchanged
++	case "":
++		s.manifest.DriveRootID = rootID
++		return RootRecorded
++	default:
++		s.manifest.DriveRootID = rootID
++		s.manifest.Records = make(map[string]model.SyncRecord)
++		s.manifest.Folders = make(map[string]string)
++		return RootReset
++	}
++}
+diff --git a/internal/statestore/store_test.go b/internal/statestore/store_test.go
+index 5d1aa30..a3ab87b 100644
+--- a/internal/statestore/store_test.go
++++ b/internal/statestore/store_test.go
+@@ -117,6 +117,105 @@ func TestStoreConcurrentAccess(t *testing.T) {
+ 	}
+ }
+ 
++func TestStoreFolderRoundTrip(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "manifest.json")
++	s, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	s.SetFolder("AI & ML", "folder-1")
++	s.SetFolder("AI & ML/papers", "folder-2")
++	// Nothing to say about the root, and an empty ID is not a mapping.
++	s.SetFolder("", "folder-root")
++	s.SetFolder("Empty", "")
++
++	if err := s.Save(); err != nil {
++		t.Fatal(err)
++	}
++	reopened, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	for dir, want := range map[string]string{"AI & ML": "folder-1", "AI & ML/papers": "folder-2"} {
++		got, ok := reopened.FolderID(dir)
++		if !ok || got != want {
++			t.Errorf("FolderID(%q) = %q, %v; want %q, true", dir, got, ok, want)
++		}
++	}
++	for _, dir := range []string{"", "Empty"} {
++		if _, ok := reopened.FolderID(dir); ok {
++			t.Errorf("FolderID(%q) unexpectedly present", dir)
++		}
++	}
++
++	reopened.DeleteFolder("AI & ML")
++	if _, ok := reopened.FolderID("AI & ML"); ok {
++		t.Error("expected the folder mapping to be gone after DeleteFolder")
++	}
++}
++
++func TestStoreMigratesV1Manifest(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "manifest.json")
++
++	// A v1 manifest, written before Folders existed.
++	v1 := `{
++  "version": 1,
++  "vaultPath": "/vault",
++  "driveRootId": "root-id",
++  "records": {"note.md": {"RelativePath": "note.md", "LocalHash": "abc"}}
++}`
++	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	s, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatalf("opening a v1 manifest: %v", err)
++	}
++	if _, ok := s.Get("note.md"); !ok {
++		t.Error("migration dropped an existing record")
++	}
++	if _, ok := s.FolderID("anything"); ok {
++		t.Error("migrated manifest should start with no remembered folders")
++	}
++
++	// Writing into the new map must work on a migrated manifest, not panic
++	// on a nil one.
++	s.SetFolder("Docker", "folder-1")
++	if err := s.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	reopened, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got, ok := reopened.FolderID("Docker"); !ok || got != "folder-1" {
++		t.Errorf("FolderID(Docker) = %q, %v after migration", got, ok)
++	}
++	if reopened.manifest.Version != model.ManifestVersion {
++		t.Errorf("manifest version = %d, want %d", reopened.manifest.Version, model.ManifestVersion)
++	}
++}
++
++func TestStoreRefusesNewerManifest(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "manifest.json")
++
++	future := `{"version": 99, "vaultPath": "/vault", "records": {}}`
++	if err := os.WriteFile(path, []byte(future), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := Open(path, "/vault"); err == nil {
++		t.Fatal("expected Open to refuse a manifest from a newer version rather than rewriting it")
++	}
++}
++
+ func TestAtomicWriteLeavesValidFileAcrossRewrites(t *testing.T) {
+ 	dir := t.TempDir()
+ 	path := filepath.Join(dir, "manifest.json")
+@@ -157,3 +256,86 @@ func TestAtomicWriteLeavesValidFileAcrossRewrites(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestStoreAdoptRootRecordsFirstRootWithoutDiscarding(t *testing.T) {
++	dir := t.TempDir()
++	s, err := Open(filepath.Join(dir, "manifest.json"), "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	s.Set(model.SyncRecord{RelativePath: "a.md", LocalHash: "1"})
++	s.SetFolder("notes", "folder-1")
++
++	// A manifest predating root tracking has no root recorded. Adopting it
++	// must keep the baseline -- wiping here would destroy sync state for
++	// every existing vault on upgrade.
++	if got := s.AdoptRoot("root-a"); got != RootRecorded {
++		t.Errorf("AdoptRoot on an untracked manifest = %v, want RootRecorded", got)
++	}
++	if _, ok := s.Get("a.md"); !ok {
++		t.Error("recording a root for the first time discarded the baseline")
++	}
++	if _, ok := s.FolderID("notes"); !ok {
++		t.Error("recording a root for the first time discarded the folder map")
++	}
++
++	if got := s.AdoptRoot("root-a"); got != RootUnchanged {
++		t.Errorf("re-adopting the same root = %v, want RootUnchanged", got)
++	}
++	if _, ok := s.Get("a.md"); !ok {
++		t.Error("re-adopting the same root discarded the baseline")
++	}
++}
++
++func TestStoreAdoptRootDiscardsBaselineWhenRootChanges(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "manifest.json")
++	s, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	s.AdoptRoot("root-a")
++	s.Set(model.SyncRecord{RelativePath: "a.md", LocalHash: "1", DriveFileID: "file-in-old-root"})
++	s.SetFolder("notes", "folder-in-old-root")
++
++	// Pointing the daemon at a different Drive folder makes every record a
++	// claim about files that have nothing to do with it.
++	if got := s.AdoptRoot("root-b"); got != RootReset {
++		t.Fatalf("AdoptRoot with a different root = %v, want RootReset", got)
++	}
++	if _, ok := s.Get("a.md"); ok {
++		t.Error("kept a baseline record pointing into the old Drive root")
++	}
++	if _, ok := s.FolderID("notes"); ok {
++		t.Error("kept a folder ID pointing into the old Drive root")
++	}
++
++	if err := s.Save(); err != nil {
++		t.Fatal(err)
++	}
++	reopened, err := Open(path, "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := reopened.AdoptRoot("root-b"); got != RootUnchanged {
++		t.Errorf("reopened manifest did not persist the new root: %v", got)
++	}
++}
++
++func TestStoreAdoptRootIgnoresEmptyRoot(t *testing.T) {
++	dir := t.TempDir()
++	s, err := Open(filepath.Join(dir, "manifest.json"), "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	s.AdoptRoot("root-a")
++	s.Set(model.SyncRecord{RelativePath: "a.md", LocalHash: "1"})
++
++	// Drive not connected yet: no root to compare against, so nothing to do.
++	if got := s.AdoptRoot(""); got != RootUnchanged {
++		t.Errorf("AdoptRoot(\"\") = %v, want RootUnchanged", got)
++	}
++	if _, ok := s.Get("a.md"); !ok {
++		t.Error("an empty root discarded the baseline")
++	}
++}
+diff --git a/internal/syncengine/emptyremote.go b/internal/syncengine/emptyremote.go
+new file mode 100644
+index 0000000..7145325
+--- /dev/null
++++ b/internal/syncengine/emptyremote.go
+@@ -0,0 +1,62 @@
++package syncengine
++
++import (
++	"fmt"
++
++	"obsynk/internal/model"
++)
++
++// EmptyRemoteListingError reports that a full sync listed the Drive root
++// and got nothing back, for a vault whose baseline says files should be
++// there.
++type EmptyRemoteListingError struct {
++	// TrackedFiles is how many live (non-tombstone) files the baseline
++	// claims exist on Drive.
++	TrackedFiles int
++}
++
++func (e *EmptyRemoteListingError) Error() string {
++	return fmt.Sprintf(
++		"syncengine: Drive returned no files, but the last sync recorded %d of them; refusing to sync because this would delete those files locally. "+
++			"If the Drive folder really was emptied, reset the sync state to re-upload; if the Drive root folder was changed, reconnect so the baseline is rebuilt.",
++		e.TrackedFiles,
++	)
++}
++
++// guardAgainstEmptyRemote refuses a full sync whose Drive listing came back
++// completely empty while the baseline says files should be there.
++//
++// Diff reads "absent from the Drive listing" as "deleted on Drive", which
++// for an otherwise-unchanged file means DecisionPullDelete -- deleting the
++// local copy. That inference is only as trustworthy as the listing, and a
++// listing can be wrong for reasons that have nothing to do with the user
++// deleting anything: the root folder was repointed at an empty folder, the
++// folder was trashed, access was revoked, or a listing call returned an
++// empty page. In every one of those the diff concludes the entire vault was
++// deleted, and acts on it.
++//
++// The rule is deliberately blunt -- empty versus not-empty, rather than a
++// "more than N%% deleted" threshold. Emptiness is unambiguous and cannot
++// false-positive on any real deletion pattern short of genuinely deleting
++// everything, which is rare, recoverable by resetting the sync state, and
++// worth one confirmation. A percentage threshold would start guessing at
++// intent and would eventually block a legitimate bulk cleanup.
++//
++// Tombstones don't count: a record marked Deleted asserts the file is
++// already gone from Drive, so its absence from the listing is expected.
++func guardAgainstEmptyRemote(remote map[string]RemoteEntry, baseline map[string]model.SyncRecord) error {
++	if len(remote) > 0 {
++		return nil
++	}
++
++	tracked := 0
++	for _, rec := range baseline {
++		if !rec.Deleted && rec.DriveFileID != "" {
++			tracked++
++		}
++	}
++	if tracked == 0 {
++		return nil
++	}
++	return &EmptyRemoteListingError{TrackedFiles: tracked}
++}
+diff --git a/internal/syncengine/emptyremote_test.go b/internal/syncengine/emptyremote_test.go
+new file mode 100644
+index 0000000..a24a0e4
+--- /dev/null
++++ b/internal/syncengine/emptyremote_test.go
+@@ -0,0 +1,75 @@
++package syncengine
++
++import (
++	"errors"
++	"testing"
++
++	"obsynk/internal/model"
++)
++
++func trackedBaseline(paths ...string) map[string]model.SyncRecord {
++	b := make(map[string]model.SyncRecord, len(paths))
++	for i, p := range paths {
++		b[p] = model.SyncRecord{RelativePath: p, DriveFileID: "file-" + string(rune('a'+i))}
++	}
++	return b
++}
++
++// The scenario this exists for: the Drive root was repointed at an empty
++// folder, so the listing is empty while the baseline is full. Diff would
++// call that a wholesale remote deletion and remove every local file.
++func TestGuardRefusesEmptyRemoteWithTrackedBaseline(t *testing.T) {
++	t.Parallel()
++
++	err := guardAgainstEmptyRemote(map[string]RemoteEntry{}, trackedBaseline("a.md", "b.md", "notes/c.md"))
++	if err == nil {
++		t.Fatal("expected an empty Drive listing to be refused, not treated as 3 deletions")
++	}
++
++	var empty *EmptyRemoteListingError
++	if !errors.As(err, &empty) {
++		t.Fatalf("got %T, want *EmptyRemoteListingError", err)
++	}
++	if empty.TrackedFiles != 3 {
++		t.Errorf("TrackedFiles = %d, want 3", empty.TrackedFiles)
++	}
++}
++
++func TestGuardAllowsLegitimateSyncs(t *testing.T) {
++	t.Parallel()
++
++	cases := map[string]struct {
++		remote   map[string]RemoteEntry
++		baseline map[string]model.SyncRecord
++	}{
++		// First sync ever: nothing on Drive, nothing recorded. Everything
++		// here is an upload, not a deletion.
++		"empty remote, empty baseline": {map[string]RemoteEntry{}, map[string]model.SyncRecord{}},
++		// A real deletion of one file among several still has a non-empty
++		// listing, so the guard must stay out of the way.
++		"non-empty remote": {
++			map[string]RemoteEntry{"a.md": {RelativePath: "a.md", FileID: "x"}},
++			trackedBaseline("a.md", "b.md"),
++		},
++		// Tombstones assert the file is already gone from Drive, so their
++		// absence from the listing is expected, not evidence of a problem.
++		"empty remote, only tombstones": {
++			map[string]RemoteEntry{},
++			map[string]model.SyncRecord{"a.md": {RelativePath: "a.md", DriveFileID: "x", Deleted: true}},
++		},
++		// A record that never reached Drive claims nothing about the listing.
++		"empty remote, baseline without drive IDs": {
++			map[string]RemoteEntry{},
++			map[string]model.SyncRecord{"a.md": {RelativePath: "a.md"}},
++		},
++	}
++
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			if err := guardAgainstEmptyRemote(tc.remote, tc.baseline); err != nil {
++				t.Errorf("guard blocked a legitimate sync: %v", err)
++			}
++		})
++	}
++}
+diff --git a/internal/syncengine/engine.go b/internal/syncengine/engine.go
+index ccb21af..371271a 100644
+--- a/internal/syncengine/engine.go
++++ b/internal/syncengine/engine.go
+@@ -67,11 +67,27 @@ func (e *Engine) FullSync(ctx context.Context) (<-chan OpResult, int, error) {
+ 	}
+ 
+ 	baseline := e.Store.Snapshot()
++	if err := guardAgainstEmptyRemote(remote, baseline); err != nil {
++		return nil, 0, err
++	}
++
+ 	ops := Plan(Diff(local, remote, baseline))
+-	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folderIDs, e.Workers)
++	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, e.newFolderCache(folderIDs), e.Workers)
+ 	return executor.Run(ctx, ops), len(ops), nil
+ }
+ 
++// newFolderCache builds the folder cache for one sync. seed carries
++// directories already read off Drive during this sync (a full tree
++// listing); everything else is resolved on demand, preferring the folder
++// IDs remembered in the statestore over a search.
++func (e *Engine) newFolderCache(seed map[string]string) *folderCache {
++	return newFolderCache(e.DriveRootID, seed, folderDeps{
++		create:  e.Drive.EnsureChildFolder,
++		verify:  e.Drive.VerifyFolder,
++		persist: e.Store,
++	})
++}
++
+ // SyncPaths reconciles only the paths implicated by a debounced batch of
+ // vault events, avoiding a full-vault rescan on every save. Rename events
+ // are special-cased into a direct, metadata-only Drive rename/move when the
+@@ -79,10 +95,15 @@ func (e *Engine) FullSync(ctx context.Context) (<-chan OpResult, int, error) {
+ // to the generic path-by-path reconciliation (which will see the old path
+ // as absent and the new path as untracked, i.e. a fresh create).
+ func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpResult, int, error) {
++	// One cache for the whole sync, shared between rename handling and the
++	// executor: a rename into a directory and an upload into that same
++	// directory must agree on which Drive folder it is.
++	folders := e.newFolderCache(nil)
++
+ 	pathSet := make(map[string]struct{}, len(events))
+ 	for _, ev := range events {
+ 		if ev.Kind == EventRename {
+-			handled, err := e.handleRename(ctx, ev.OldRelativePath, ev.RelativePath)
++			handled, err := e.handleRename(ctx, folders, ev.OldRelativePath, ev.RelativePath)
+ 			if err != nil {
+ 				return nil, 0, err
+ 			}
+@@ -98,7 +119,7 @@ func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpRe
+ 		relPaths = append(relPaths, p)
+ 	}
+ 
+-	return e.syncRelPaths(ctx, relPaths)
++	return e.syncRelPaths(ctx, folders, relPaths)
+ }
+ 
+ // syncRelPaths scans only the given relative paths locally, and resolves
+@@ -114,11 +135,10 @@ func (e *Engine) SyncPaths(ctx context.Context, events []FileEvent) (<-chan OpRe
+ // single-writer personal vault; a full FullSync (or the periodic
+ // reconciliation flagged as a future mitigation for remote-only changes)
+ // would catch and resolve it.
+-func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan OpResult, int, error) {
++func (e *Engine) syncRelPaths(ctx context.Context, folders *folderCache, relPaths []string) (<-chan OpResult, int, error) {
+ 	local := make(map[string]model.FileMetadata)
+ 	remote := make(map[string]RemoteEntry)
+ 	baseline := make(map[string]model.SyncRecord)
+-	folderIDs := map[string]string{"": e.DriveRootID}
+ 
+ 	for _, relPath := range relPaths {
+ 		relPath = filepath.ToSlash(relPath)
+@@ -174,13 +194,16 @@ func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan Op
+ 			ModTime:      modTime,
+ 			ParentID:     parentID,
+ 		}
+-		if parentID != "" {
+-			folderIDs[parentOf(relPath)] = parentID
+-		}
++		// Deliberately not seeding the folder cache with parentID here. It's
++		// where this file currently sits on Drive, which is only the folder
++		// for parentOf(relPath) as long as nobody has moved the file --
++		// seeding it would send the rest of the batch's uploads wherever a
++		// single moved file happens to live. The folder cache resolves the
++		// directory itself, from IDs recorded for directories.
+ 	}
+ 
+ 	ops := Plan(Diff(local, remote, baseline))
+-	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folderIDs, e.Workers)
++	executor := NewExecutor(e.Drive, e.Store, e.VaultRoot, e.DriveRootID, folders, e.Workers)
+ 	return executor.Run(ctx, ops), len(ops), nil
+ }
+ 
+@@ -188,7 +211,7 @@ func (e *Engine) syncRelPaths(ctx context.Context, relPaths []string) (<-chan Op
+ // vault rename event, when the old path's Drive counterpart is already
+ // known. Returns handled=false (no error) when there's no baseline to act
+ // on, so the caller falls back to generic reconciliation.
+-func (e *Engine) handleRename(ctx context.Context, oldRel, newRel string) (handled bool, err error) {
++func (e *Engine) handleRename(ctx context.Context, folders *folderCache, oldRel, newRel string) (handled bool, err error) {
+ 	oldRel = filepath.ToSlash(oldRel)
+ 	newRel = filepath.ToSlash(newRel)
+ 
+@@ -197,13 +220,9 @@ func (e *Engine) handleRename(ctx context.Context, oldRel, newRel string) (handl
+ 		return false, nil
+ 	}
+ 
+-	newParentID := e.DriveRootID
+-	if newParent := parentOf(newRel); newParent != "" {
+-		id, ferr := e.Drive.EnsureSubfolders(ctx, e.DriveRootID, newParent)
+-		if ferr != nil {
+-			return false, fmt.Errorf("syncengine: ensuring folder for rename target %s: %w", newRel, ferr)
+-		}
+-		newParentID = id
++	newParentID, ferr := folders.resolve(ctx, parentOf(newRel))
++	if ferr != nil {
++		return false, fmt.Errorf("syncengine: ensuring folder for rename target %s: %w", newRel, ferr)
+ 	}
+ 
+ 	newName := stdpath.Base(newRel)
+diff --git a/internal/syncengine/executor.go b/internal/syncengine/executor.go
+index 3b4b89a..c7ec08a 100644
+--- a/internal/syncengine/executor.go
++++ b/internal/syncengine/executor.go
+@@ -33,17 +33,14 @@ type Executor struct {
+ 	rootID    string
+ 	workers   int
+ 
+-	folderMu  sync.Mutex
+-	folderIDs map[string]string // relative dir path ("" = root) -> Drive folder ID
++	folders *folderCache
+ }
+ 
+-// NewExecutor builds an Executor. folderIDs may be nil or pre-seeded (e.g.
+-// from a prior full Drive tree listing) to avoid redundant EnsureSubfolders
+-// calls for directories already known.
+-func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot, rootID string, folderIDs map[string]string, workers int) *Executor {
+-	if folderIDs == nil {
+-		folderIDs = make(map[string]string)
+-	}
++// NewExecutor builds an Executor. folders is the sync's folder cache, built
++// by the Engine and shared with anything else in the same sync that has to
++// resolve a directory (rename handling), so one directory is resolved once
++// per sync however many code paths need it.
++func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot, rootID string, folders *folderCache, workers int) *Executor {
+ 	if workers <= 0 {
+ 		workers = 4
+ 	}
+@@ -53,7 +50,7 @@ func NewExecutor(driveClient *drive.Client, store *statestore.Store, vaultRoot,
+ 		vaultRoot: vaultRoot,
+ 		rootID:    rootID,
+ 		workers:   workers,
+-		folderIDs: folderIDs,
++		folders:   folders,
+ 	}
+ }
+ 
+@@ -238,26 +235,14 @@ func (e *Executor) pullDelete(_ context.Context, op Operation) error {
+ }
+ 
+ // ensureParentFolder resolves (creating if needed) the Drive folder for
+-// relPath's parent directory, caching the result for the lifetime of this
+-// Executor so files landing in the same new directory within one batch
+-// don't repeat the lookup/creation.
++// relPath's parent directory. The folderCache resolves each directory
++// exactly once for the lifetime of this Executor, so workers pushing into
++// the same new directory share one creation instead of racing to make
++// duplicates of it.
+ func (e *Executor) ensureParentFolder(ctx context.Context, relPath string) (string, error) {
+-	dir := parentOf(relPath)
+-
+-	e.folderMu.Lock()
+-	if id, ok := e.folderIDs[dir]; ok {
+-		e.folderMu.Unlock()
+-		return id, nil
+-	}
+-	e.folderMu.Unlock()
+-
+-	id, err := e.drive.EnsureSubfolders(ctx, e.rootID, dir)
++	id, err := e.folders.resolve(ctx, parentOf(relPath))
+ 	if err != nil {
+ 		return "", fmt.Errorf("syncengine: ensuring folder for %s: %w", relPath, err)
+ 	}
+-
+-	e.folderMu.Lock()
+-	e.folderIDs[dir] = id
+-	e.folderMu.Unlock()
+ 	return id, nil
+ }
+diff --git a/internal/syncengine/foldercache.go b/internal/syncengine/foldercache.go
+new file mode 100644
+index 0000000..0312675
+--- /dev/null
++++ b/internal/syncengine/foldercache.go
+@@ -0,0 +1,197 @@
++package syncengine
++
++import (
++	"context"
++	stdpath "path"
++	"sync"
++)
++
++// createFolderFunc finds-or-creates a single folder named name directly
++// under parentID, returning its Drive folder ID.
++type createFolderFunc func(ctx context.Context, parentID, name string) (string, error)
++
++// verifyFolderFunc reports whether folderID still names a live folder
++// directly under parentID. A stale ID is (false, nil); only a failure to
++// check at all is an error.
++type verifyFolderFunc func(ctx context.Context, folderID, parentID string) (bool, error)
++
++// folderPersister remembers directory-to-folder-ID mappings across syncs.
++// Satisfied by *statestore.Store.
++type folderPersister interface {
++	FolderID(dir string) (string, bool)
++	SetFolder(dir, id string)
++	DeleteFolder(dir string)
++}
++
++// folderDeps are folderCache's collaborators.
++type folderDeps struct {
++	// create finds-or-creates one folder by name under a parent. Required.
++	create createFolderFunc
++	// verify checks a remembered folder ID is still usable. Required
++	// whenever persist is set.
++	verify verifyFolderFunc
++	// persist remembers resolved folder IDs across syncs. Optional; when
++	// nil the cache resolves by search alone, as it did before.
++	persist folderPersister
++}
++
++// folderCache maps relative directory paths ("" = the sync root) to Drive
++// folder IDs, resolving each path exactly once even when many workers push
++// files into the same directory at the same time.
++//
++// The serialization is the point, not the caching. Find-or-create on Drive
++// is a list-then-create round trip, so without it N workers racing on the
++// same missing directory all see an empty list and all create it -- which
++// is how a first sync ended up with three or four copies of each folder on
++// Drive and the vault's files scattered across them.
++//
++// Entries are per path component, so siblings ("A/B" and "A/C") still
++// resolve concurrently while sharing the single resolution of "A".
++//
++// The in-memory entries only live as long as one sync batch. Across syncs
++// the cache leans on deps.persist, which is what keeps a folder created by
++// one batch from being created again by the next: Drive's search index is
++// eventually consistent, so a freshly created folder can still be invisible
++// to the find-or-create search seconds later.
++type folderCache struct {
++	rootID string
++	deps   folderDeps
++
++	mu      sync.Mutex
++	entries map[string]*folderEntry
++}
++
++// folderEntry is one directory's resolution, in flight or complete. id and
++// err are written only by the goroutine that created the entry, and read by
++// others only after ready closes.
++type folderEntry struct {
++	ready chan struct{}
++	id    string
++	err   error
++}
++
++// newFolderCache builds a cache rooted at rootID. seed pre-populates
++// already-known directories, keyed the same way: forward-slash paths
++// relative to the root.
++//
++// Seeds are trusted without verification -- they come from a listing made
++// during this same sync -- and are written through to deps.persist, so a
++// full sync's tree listing doubles as a refresh of the remembered folder
++// IDs.
++func newFolderCache(rootID string, seed map[string]string, deps folderDeps) *folderCache {
++	fc := &folderCache{
++		rootID:  rootID,
++		deps:    deps,
++		entries: make(map[string]*folderEntry, len(seed)),
++	}
++	for dir, id := range seed {
++		fc.remember(dir, id)
++	}
++	return fc
++}
++
++// remember records a directory's Drive folder ID as already resolved,
++// skipping both verification and the search. Only for mappings read
++// straight off Drive during this same sync (a tree listing), which are
++// fresher than anything stored -- hence the write-through to persist.
++func (fc *folderCache) remember(dir, id string) {
++	if dir == "" || id == "" {
++		return
++	}
++
++	fc.mu.Lock()
++	if _, exists := fc.entries[dir]; exists {
++		fc.mu.Unlock()
++		return
++	}
++	ready := make(chan struct{})
++	close(ready)
++	fc.entries[dir] = &folderEntry{ready: ready, id: id}
++	fc.mu.Unlock()
++
++	if fc.deps.persist != nil {
++		fc.deps.persist.SetFolder(dir, id)
++	}
++}
++
++// resolve returns the Drive folder ID for dir, creating it and any missing
++// ancestors. Concurrent callers for the same dir share one resolution.
++func (fc *folderCache) resolve(ctx context.Context, dir string) (string, error) {
++	if dir == "" || dir == "." {
++		return fc.rootID, nil
++	}
++
++	fc.mu.Lock()
++	if ent, ok := fc.entries[dir]; ok {
++		fc.mu.Unlock()
++		select {
++		case <-ent.ready:
++			return ent.id, ent.err
++		case <-ctx.Done():
++			return "", ctx.Err()
++		}
++	}
++	ent := &folderEntry{ready: make(chan struct{})}
++	fc.entries[dir] = ent
++	fc.mu.Unlock()
++
++	// Resolve the parent through the cache as well, so a shared ancestor is
++	// created once however many descendants race for it. No lock is held
++	// across this call, so the recursion can't deadlock.
++	parentID, err := fc.resolve(ctx, parentOf(dir))
++	if err != nil {
++		ent.err = err
++	} else {
++		ent.id, ent.err = fc.lookup(ctx, dir, parentID)
++	}
++	err = ent.err
++	close(ent.ready)
++
++	if err != nil {
++		// Drop failures rather than caching them: a transient Drive error
++		// while creating one folder shouldn't fail every remaining file
++		// bound for it.
++		fc.mu.Lock()
++		if fc.entries[dir] == ent {
++			delete(fc.entries, dir)
++		}
++		fc.mu.Unlock()
++		return "", err
++	}
++	return ent.id, nil
++}
++
++// lookup resolves a single directory not already in the in-memory cache:
++// reuse the remembered ID if it's still live, otherwise find-or-create by
++// name and remember the result.
++func (fc *folderCache) lookup(ctx context.Context, dir, parentID string) (string, error) {
++	if fc.deps.persist != nil {
++		if id, ok := fc.deps.persist.FolderID(dir); ok {
++			live, err := fc.deps.verify(ctx, id, parentID)
++			if err != nil {
++				// Deliberately fail the operation rather than falling back to
++				// find-or-create. A failed check says nothing about whether
++				// the folder is there, and guessing "it isn't" is how you
++				// create a duplicate -- the exact outcome this is here to
++				// prevent. The sync retries; a duplicate is forever.
++				return "", err
++			}
++			if live {
++				return id, nil
++			}
++			// Trashed, moved, or gone: the mapping is stale, so drop it and
++			// fall through to recreating the folder where the path says it
++			// belongs.
++			fc.deps.persist.DeleteFolder(dir)
++		}
++	}
++
++	id, err := fc.deps.create(ctx, parentID, stdpath.Base(dir))
++	if err != nil {
++		return "", err
++	}
++	if fc.deps.persist != nil {
++		fc.deps.persist.SetFolder(dir, id)
++	}
++	return id, nil
++}
+diff --git a/internal/syncengine/foldercache_test.go b/internal/syncengine/foldercache_test.go
+new file mode 100644
+index 0000000..94eb3da
+--- /dev/null
++++ b/internal/syncengine/foldercache_test.go
+@@ -0,0 +1,503 @@
++package syncengine
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++)
++
++// fakeFolder is one folder as it actually exists on the fake Drive,
++// addressable by ID regardless of what the search index currently shows.
++type fakeFolder struct {
++	name    string
++	parent  string
++	trashed bool
++}
++
++// fakeDrive models the two Drive calls folderCache makes, and -- crucially
++// -- the fact that they read different things. EnsureChildFolder searches
++// an index that lags behind writes; VerifyFolder is a get-by-ID that
++// doesn't.
++type fakeDrive struct {
++	mu sync.Mutex
++
++	byID    map[string]*fakeFolder       // the truth, as get-by-ID sees it
++	index   map[string]map[string]string // parentID -> name -> ID, as search sees it
++	creates map[string]int               // "parentID/name" -> times created
++	seq     int
++
++	// blindSearch makes every search miss, standing in for Drive's index
++	// not yet reflecting a folder that was created moments ago.
++	blindSearch bool
++	// failures injects transient create failures, keyed "parentID/name".
++	failures map[string]int
++	// verifyErr, when set, makes verification fail outright (a network
++	// error, say) rather than reporting a folder present or absent.
++	verifyErr error
++	verifies  int
++}
++
++func newFakeDrive() *fakeDrive {
++	return &fakeDrive{
++		byID:     make(map[string]*fakeFolder),
++		index:    make(map[string]map[string]string),
++		creates:  make(map[string]int),
++		failures: make(map[string]int),
++	}
++}
++
++func (d *fakeDrive) ensureChild(_ context.Context, parentID, name string) (string, error) {
++	key := parentID + "/" + name
++
++	d.mu.Lock()
++	if !d.blindSearch {
++		if id, ok := d.index[parentID][name]; ok {
++			d.mu.Unlock()
++			return id, nil
++		}
++	}
++	if d.failures[key] > 0 {
++		d.failures[key]--
++		d.mu.Unlock()
++		return "", errors.New("drive: transient failure")
++	}
++	d.mu.Unlock()
++
++	// The list-to-create window that concurrent callers used to race in.
++	time.Sleep(5 * time.Millisecond)
++
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	d.seq++
++	id := fmt.Sprintf("folder-%d", d.seq)
++	d.byID[id] = &fakeFolder{name: name, parent: parentID}
++	if d.index[parentID] == nil {
++		d.index[parentID] = make(map[string]string)
++	}
++	// Last writer wins, mirroring Drive handing back an arbitrary one of
++	// several same-named folders on a later search.
++	d.index[parentID][name] = id
++	d.creates[key]++
++	return id, nil
++}
++
++func (d *fakeDrive) verifyFolder(_ context.Context, folderID, parentID string) (bool, error) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	d.verifies++
++	if d.verifyErr != nil {
++		return false, d.verifyErr
++	}
++	f, ok := d.byID[folderID]
++	if !ok || f.trashed {
++		return false, nil
++	}
++	return parentID == "" || f.parent == parentID, nil
++}
++
++func (d *fakeDrive) createCount(parentID, name string) int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.creates[parentID+"/"+name]
++}
++
++// trash marks a folder deleted on Drive, as a user emptying it into the bin
++// would, leaving any remembered ID pointing at it stale.
++func (d *fakeDrive) trash(folderID string) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	f := d.byID[folderID]
++	f.trashed = true
++	delete(d.index[f.parent], f.name)
++}
++
++// move reparents a folder, as dragging it elsewhere in Drive would.
++func (d *fakeDrive) move(folderID, newParent string) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	f := d.byID[folderID]
++	delete(d.index[f.parent], f.name)
++	f.parent = newParent
++	if d.index[newParent] == nil {
++		d.index[newParent] = make(map[string]string)
++	}
++	d.index[newParent][f.name] = folderID
++}
++
++// fakePersister stands in for the statestore's folder map.
++type fakePersister struct {
++	mu      sync.Mutex
++	folders map[string]string
++	deletes int
++}
++
++func newFakePersister(seed map[string]string) *fakePersister {
++	p := &fakePersister{folders: make(map[string]string)}
++	for k, v := range seed {
++		p.folders[k] = v
++	}
++	return p
++}
++
++func (p *fakePersister) FolderID(dir string) (string, bool) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	id, ok := p.folders[dir]
++	return id, ok
++}
++
++func (p *fakePersister) SetFolder(dir, id string) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.folders[dir] = id
++}
++
++func (p *fakePersister) DeleteFolder(dir string) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	delete(p.folders, dir)
++	p.deletes++
++}
++
++func (p *fakePersister) get(dir string) string {
++	id, _ := p.FolderID(dir)
++	return id
++}
++
++// searchOnly builds deps with no cross-sync persistence, for the tests that
++// only care about within-batch behavior.
++func searchOnly(d *fakeDrive) folderDeps {
++	return folderDeps{create: d.ensureChild}
++}
++
++func withPersistence(d *fakeDrive, p *fakePersister) folderDeps {
++	return folderDeps{create: d.ensureChild, verify: d.verifyFolder, persist: p}
++}
++
++// resolveAll resolves every dir concurrently and returns the resulting IDs
++// in the same order.
++func resolveAll(t *testing.T, fc *folderCache, dirs []string) []string {
++	t.Helper()
++
++	ids := make([]string, len(dirs))
++	errs := make([]error, len(dirs))
++	start := make(chan struct{})
++
++	var wg sync.WaitGroup
++	for i, dir := range dirs {
++		wg.Add(1)
++		go func(i int, dir string) {
++			defer wg.Done()
++			<-start
++			ids[i], errs[i] = fc.resolve(context.Background(), dir)
++		}(i, dir)
++	}
++	close(start)
++	wg.Wait()
++
++	for i, err := range errs {
++		if err != nil {
++			t.Fatalf("resolve(%q): %v", dirs[i], err)
++		}
++	}
++	return ids
++}
++
++func TestFolderCacheCreatesEachDirectoryOnceUnderConcurrency(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	fc := newFolderCache("root", nil, searchOnly(d))
++
++	// Eight files landing in the same brand-new folder, one per worker --
++	// the shape of a first full sync, which used to leave one Drive folder
++	// per worker with the files split between them.
++	dirs := make([]string, 8)
++	for i := range dirs {
++		dirs[i] = "AI & ML"
++	}
++
++	ids := resolveAll(t, fc, dirs)
++
++	if got := d.createCount("root", "AI & ML"); got != 1 {
++		t.Errorf("created %q %d times, want 1 (duplicate folders on Drive)", "AI & ML", got)
++	}
++	for i, id := range ids {
++		if id != ids[0] {
++			t.Errorf("resolve #%d returned folder %q, want %q -- files would be split across folders", i, id, ids[0])
++		}
++	}
++}
++
++func TestFolderCacheCreatesSharedAncestorOnce(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	fc := newFolderCache("root", nil, searchOnly(d))
++
++	dirs := []string{"AI & ML/papers", "AI & ML/notes", "AI & ML/notes", "AI & ML/papers/2026", "Postgres"}
++	ids := resolveAll(t, fc, dirs)
++
++	if got := d.createCount("root", "AI & ML"); got != 1 {
++		t.Errorf("created shared ancestor %d times, want 1", got)
++	}
++	for _, want := range []struct{ parent, name string }{
++		{ids[0], "2026"}, {"root", "Postgres"},
++	} {
++		if got := d.createCount(want.parent, want.name); got != 1 {
++			t.Errorf("created %q under %q %d times, want 1", want.name, want.parent, got)
++		}
++	}
++	if ids[1] != ids[2] {
++		t.Errorf("same dir resolved to %q and %q", ids[1], ids[2])
++	}
++	if got := d.createCount("root", "AI & ML/papers"); got != 0 {
++		t.Errorf("resolved a nested path as one folder name")
++	}
++}
++
++func TestFolderCacheRootAndSeededDirsSkipCreation(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	fc := newFolderCache("root", map[string]string{"Docker": "existing-docker"}, searchOnly(d))
++
++	for _, dir := range []string{"", "."} {
++		id, err := fc.resolve(context.Background(), dir)
++		if err != nil {
++			t.Fatalf("resolve(%q): %v", dir, err)
++		}
++		if id != "root" {
++			t.Errorf("resolve(%q) = %q, want root", dir, id)
++		}
++	}
++
++	id, err := fc.resolve(context.Background(), "Docker")
++	if err != nil {
++		t.Fatalf("resolve(Docker): %v", err)
++	}
++	if id != "existing-docker" {
++		t.Errorf("resolve(Docker) = %q, want the seeded ID", id)
++	}
++	if got := d.createCount("root", "Docker"); got != 0 {
++		t.Errorf("created a seeded folder %d times, want 0", got)
++	}
++}
++
++func TestFolderCacheDoesNotCacheFailures(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	d.failures["root/Golang"] = 1
++	fc := newFolderCache("root", nil, searchOnly(d))
++
++	if _, err := fc.resolve(context.Background(), "Golang"); err == nil {
++		t.Fatal("expected the injected failure to surface")
++	}
++
++	id, err := fc.resolve(context.Background(), "Golang")
++	if err != nil {
++		t.Fatalf("retry after a transient failure: %v", err)
++	}
++	if id == "" {
++		t.Error("retry returned an empty folder ID")
++	}
++}
++
++func TestFolderCacheResolveHonorsContextCancellation(t *testing.T) {
++	t.Parallel()
++
++	release := make(chan struct{})
++	started := make(chan struct{})
++	var once sync.Once
++	blocking := func(_ context.Context, _, _ string) (string, error) {
++		once.Do(func() { close(started) })
++		<-release
++		return "folder-1", nil
++	}
++	fc := newFolderCache("root", nil, folderDeps{create: blocking})
++
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		fc.resolve(context.Background(), "Linux") //nolint:errcheck // holds the entry in flight
++	}()
++
++	// The entry is registered before create runs, so once create has been
++	// entered the next resolve is necessarily a waiter, not the owner.
++	<-started
++
++	ctx, cancel := context.WithCancel(context.Background())
++	waiterDone := make(chan error, 1)
++	go func() {
++		_, err := fc.resolve(ctx, "Linux")
++		waiterDone <- err
++	}()
++
++	cancel()
++	select {
++	case err := <-waiterDone:
++		if !errors.Is(err, context.Canceled) {
++			t.Errorf("waiter returned %v, want context.Canceled", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Error("a waiting resolve ignored context cancellation")
++	}
++
++	close(release)
++	wg.Wait()
++}
++
++// The cross-sync case: sync one creates the folder, sync two gets a fresh
++// cache and a search index that hasn't caught up yet. Without the
++// remembered ID, sync two searches, finds nothing, and creates a duplicate.
++func TestFolderCacheReusesRememberedIDWhenSearchIndexLags(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	p := newFakePersister(nil)
++
++	first := newFolderCache("root", nil, withPersistence(d, p))
++	id, err := first.resolve(context.Background(), "AI & ML")
++	if err != nil {
++		t.Fatalf("first sync: %v", err)
++	}
++	if got := p.get("AI & ML"); got != id {
++		t.Fatalf("first sync remembered %q, want %q", got, id)
++	}
++
++	// Sync two, seconds later: new cache, and Drive's search still can't
++	// see the folder created a moment ago.
++	d.blindSearch = true
++	second := newFolderCache("root", nil, withPersistence(d, p))
++	got, err := second.resolve(context.Background(), "AI & ML")
++	if err != nil {
++		t.Fatalf("second sync: %v", err)
++	}
++
++	if got != id {
++		t.Errorf("second sync resolved to %q, want the remembered %q", got, id)
++	}
++	if n := d.createCount("root", "AI & ML"); n != 1 {
++		t.Errorf("created %q %d times across two syncs, want 1", "AI & ML", n)
++	}
++}
++
++func TestFolderCacheRecreatesWhenRememberedFolderIsStale(t *testing.T) {
++	t.Parallel()
++
++	staleWays := map[string]func(d *fakeDrive, id string){
++		"trashed":        func(d *fakeDrive, id string) { d.trash(id) },
++		"movedElsewhere": func(d *fakeDrive, id string) { d.move(id, "somewhere-else") },
++		"gone": func(d *fakeDrive, id string) {
++			d.mu.Lock()
++			defer d.mu.Unlock()
++			f := d.byID[id]
++			delete(d.byID, id)
++			delete(d.index[f.parent], f.name)
++		},
++	}
++
++	for name, makeStale := range staleWays {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			d := newFakeDrive()
++			p := newFakePersister(nil)
++
++			first := newFolderCache("root", nil, withPersistence(d, p))
++			id, err := first.resolve(context.Background(), "Postgres")
++			if err != nil {
++				t.Fatalf("first sync: %v", err)
++			}
++
++			makeStale(d, id)
++
++			second := newFolderCache("root", nil, withPersistence(d, p))
++			got, err := second.resolve(context.Background(), "Postgres")
++			if err != nil {
++				t.Fatalf("second sync: %v", err)
++			}
++
++			if got == id {
++				t.Errorf("reused stale folder %q -- uploads would land somewhere the vault path doesn't point", id)
++			}
++			if n := d.createCount("root", "Postgres"); n != 2 {
++				t.Errorf("created %q %d times, want 2 (once, then again after it went stale)", "Postgres", n)
++			}
++			if p.get("Postgres") != got {
++				t.Errorf("remembered %q after recreating as %q", p.get("Postgres"), got)
++			}
++			if p.deletes != 1 {
++				t.Errorf("dropped the stale mapping %d times, want 1", p.deletes)
++			}
++		})
++	}
++}
++
++// A verification that can't complete says nothing about whether the folder
++// is there. Guessing "absent" is what creates duplicates, so the operation
++// must fail instead.
++func TestFolderCacheFailsRatherThanGuessingWhenVerifyErrors(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	p := newFakePersister(map[string]string{"BigData": "folder-known"})
++	d.verifyErr = errors.New("drive: network unreachable")
++
++	fc := newFolderCache("root", nil, withPersistence(d, p))
++	if _, err := fc.resolve(context.Background(), "BigData"); err == nil {
++		t.Fatal("expected the verification failure to surface")
++	}
++	if n := d.createCount("root", "BigData"); n != 0 {
++		t.Errorf("created a folder %d times after a failed check, want 0", n)
++	}
++	if p.get("BigData") != "folder-known" {
++		t.Error("dropped a remembered mapping on a failed check, rather than leaving it for the retry")
++	}
++}
++
++func TestFolderCacheRemembersSeededDirs(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	p := newFakePersister(nil)
++
++	// A full sync seeds from its Drive tree listing; those IDs are the
++	// freshest available, so they should refresh what's remembered.
++	newFolderCache("root", map[string]string{"Linux": "folder-linux", "Linux/kernel": "folder-kernel"}, withPersistence(d, p))
++
++	if p.get("Linux") != "folder-linux" || p.get("Linux/kernel") != "folder-kernel" {
++		t.Errorf("seeded dirs not remembered: %v", p.folders)
++	}
++	if d.verifies != 0 {
++		t.Errorf("verified %d seeded dirs, want 0 -- a listing from this same sync is already fresh", d.verifies)
++	}
++}
++
++func TestFolderCacheVerifiesRememberedDirOnlyOncePerBatch(t *testing.T) {
++	t.Parallel()
++
++	d := newFakeDrive()
++	p := newFakePersister(nil)
++
++	first := newFolderCache("root", nil, withPersistence(d, p))
++	if _, err := first.resolve(context.Background(), "Python"); err != nil {
++		t.Fatalf("first sync: %v", err)
++	}
++
++	second := newFolderCache("root", nil, withPersistence(d, p))
++	dirs := make([]string, 6)
++	for i := range dirs {
++		dirs[i] = "Python"
++	}
++	resolveAll(t, second, dirs)
++
++	if d.verifies != 1 {
++		t.Errorf("verified %d times for 6 files in one directory, want 1", d.verifies)
++	}
++}
+diff --git a/internal/syncengine/plan.go b/internal/syncengine/plan.go
+index 6b67061..06ca20c 100644
+--- a/internal/syncengine/plan.go
++++ b/internal/syncengine/plan.go
+@@ -25,8 +25,9 @@ type Operation struct {
+ // (nothing to do) and ordering shallower paths before deeper ones so that,
+ // e.g., a push into a brand-new subdirectory is ordered after any operation
+ // for a shallower path that might create part of that directory structure.
+-// Folder creation itself is idempotent (internal/drive.EnsureSubfolders), so
+-// this ordering is about predictability, not correctness.
++// Ordering is about predictability, not correctness: ops run concurrently,
++// so it guarantees nothing about which directory exists when. Making
++// directory creation safe under that concurrency is folderCache's job.
+ func Plan(results []DiffResult) []Operation {
+ 	ops := make([]Operation, 0, len(results))
+ 	for _, r := range results {
+diff --git a/plugin/src/main.ts b/plugin/src/main.ts
+index 4bcc612..1baa629 100644
+--- a/plugin/src/main.ts
++++ b/plugin/src/main.ts
+@@ -61,14 +61,22 @@ export default class ObsynkPlugin extends Plugin {
+ 			return;
+ 		}
+ 
+-		this.registerEvent(this.app.vault.on("modify", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "MODIFY")));
+-		this.registerEvent(this.app.vault.on("create", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "CREATE")));
+-		this.registerEvent(this.app.vault.on("delete", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "DELETE")));
+-		this.registerEvent(
+-			this.app.vault.on("rename", (f: TAbstractFile, oldPath: string) =>
+-				this.eventQueue.enqueue(f.path, "RENAME", oldPath),
+-			),
+-		);
++		// Registered only once the workspace is ready. Obsidian replays a
++		// "create" for every existing file while it builds its initial index,
++		// so subscribing during onload enqueues the entire vault as a single
++		// event batch -- a full sync in all but name, which would then run
++		// concurrently with any real sync and duplicate every folder on Drive.
++		this.app.workspace.onLayoutReady(() => {
++			this.registerEvent(this.app.vault.on("modify", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "MODIFY")));
++			this.registerEvent(this.app.vault.on("create", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "CREATE")));
++			this.registerEvent(this.app.vault.on("delete", (f: TAbstractFile) => this.eventQueue.enqueue(f.path, "DELETE")));
++			this.registerEvent(
++				this.app.vault.on("rename", (f: TAbstractFile, oldPath: string) =>
++					this.eventQueue.enqueue(f.path, "RENAME", oldPath),
++				),
++			);
++			this.logger?.info("Vault watchers registered (post-layout).");
++		});
+ 	}
+ 
+ 	async onunload(): Promise<void> {
+-- 
+2.47.0.windows.2
+

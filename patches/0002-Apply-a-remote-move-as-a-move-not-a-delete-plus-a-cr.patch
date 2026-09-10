@@ -1,0 +1,507 @@
+From b2bb7773dca8a6126921e1db15ac2b58f82dd7f7 Mon Sep 17 00:00:00 2001
+From: spiritedman4 <sivamsrini214@gmail.com>
+Date: Tue, 8 Sep 2026 07:23:15 +0530
+Subject: [PATCH] Apply a remote move as a move, not a delete plus a create
+
+Moving files into a different folder on one machine duplicated them on the
+other: the second machine downloaded the files at their new path but kept
+the originals at the old one, and re-uploaded them, undoing the move on
+Drive.
+
+Diff is keyed by path, so a move arrives as two unrelated facts -- a file
+gone from one path, a file appeared at another. Judged separately the old
+path is a deletion and the new path a creation. That is survivable while
+both machines' baselines agree, but the delete half removes the baseline
+record for the old path, and a machine that still holds the file there then
+has a local file with no baseline: decideNoBaseline reads it as brand new
+and uploads it, resurrecting the move's source. The other machine downloads
+that back, and the duplicate is permanent on both sides.
+
+Diff now detects moves before per-path judgement and emits a single
+DecisionMoveLocal, which renames the file on disk and carries its baseline
+record across. The old path never loses its record, so nothing can resurrect
+it, and content already on disk is not downloaded again.
+
+Matching is by Drive file ID: it is the only identity that survives a move,
+since local hashes are sha256 while Drive reports md5, so content cannot be
+compared across the boundary. Only unambiguous moves qualify -- destination
+untracked and unoccupied locally, source still on disk, content unchanged on
+both sides. A move tangled up with an edit falls back to the ordinary rules,
+which are conservative and do not lose data.
+
+Also prunes directories emptied by a move or a remote deletion. Nothing else
+ever removed them, since the engine tracks files and not directories, so
+every move left its source folder behind for good.
+
+Not addressed: a machine whose baseline was reset still has files with no
+record and cannot tell a leftover from a genuinely new file, so it will
+upload them. Nothing in the manifest distinguishes the two, and local
+sha256 cannot be matched against Drive's md5 to infer it from content.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/syncengine/diff.go      |  89 ++++++++++++++
+ internal/syncengine/executor.go  |  60 ++++++++++
+ internal/syncengine/move_test.go | 199 +++++++++++++++++++++++++++++++
+ internal/syncengine/plan.go      |  17 ++-
+ 4 files changed, 359 insertions(+), 6 deletions(-)
+ create mode 100644 internal/syncengine/move_test.go
+
+diff --git a/internal/syncengine/diff.go b/internal/syncengine/diff.go
+index 188ef04..45a4acc 100644
+--- a/internal/syncengine/diff.go
++++ b/internal/syncengine/diff.go
+@@ -32,6 +32,14 @@ const (
+ 	// DecisionCreateRemote uploads a file that exists locally but was never
+ 	// synced before and has no Drive copy.
+ 	DecisionCreateRemote
++	// DecisionMoveLocal relocates a local file whose Drive counterpart moved
++	// to a different path since the last sync, identified by Drive file ID.
++	// Without this a move arrives as a delete at the old path plus a create
++	// at the new one, which re-downloads content that is already on disk and,
++	// worse, leaves the old path with no baseline record -- so a machine that
++	// still holds the file there re-uploads it and resurrects the move's
++	// source on Drive.
++	DecisionMoveLocal
+ )
+ 
+ func (d Decision) String() string {
+@@ -52,6 +60,8 @@ func (d Decision) String() string {
+ 		return "create_local"
+ 	case DecisionCreateRemote:
+ 		return "create_remote"
++	case DecisionMoveLocal:
++		return "move_local"
+ 	default:
+ 		return "unknown"
+ 	}
+@@ -83,6 +93,11 @@ type DiffResult struct {
+ 	// Winner is "local" or "remote", set only when Decision ==
+ 	// DecisionConflict.
+ 	Winner string
++
++	// OldRelativePath is where the file currently sits locally, set only
++	// when Decision == DecisionMoveLocal. Local and Baseline describe that
++	// old path; RelativePath and Remote describe where it belongs now.
++	OldRelativePath string
+ }
+ 
+ // Diff compares the current local scan, the current Drive listing, and the
+@@ -101,8 +116,36 @@ func Diff(local map[string]model.FileMetadata, remote map[string]RemoteEntry, ba
+ 		paths[p] = struct{}{}
+ 	}
+ 
++	// Moves are resolved before anything else: both endpoints of a move are
++	// in paths, and each would otherwise be judged on its own as a deletion
++	// and an unrelated creation.
++	movedTo := detectMoves(local, remote, baseline)
++	movedFrom := make(map[string]struct{}, len(movedTo))
++	for _, old := range movedTo {
++		movedFrom[old] = struct{}{}
++	}
++
+ 	results := make([]DiffResult, 0, len(paths))
+ 	for p := range paths {
++		if _, isSource := movedFrom[p]; isSource {
++			// Consumed by the move emitted at its destination.
++			continue
++		}
++		if oldPath, moved := movedTo[p]; moved {
++			oldLocal := local[oldPath]
++			oldBaseline := baseline[oldPath]
++			newRemote := remote[p]
++			results = append(results, DiffResult{
++				RelativePath:    p,
++				OldRelativePath: oldPath,
++				Decision:        DecisionMoveLocal,
++				Local:           &oldLocal,
++				Remote:          &newRemote,
++				Baseline:        &oldBaseline,
++			})
++			continue
++		}
++
+ 		l, hasLocal := local[p]
+ 		r, hasRemote := remote[p]
+ 		b, hasBaseline := baseline[p]
+@@ -190,3 +233,49 @@ func resolveWinner(localTime, remoteTime time.Time) string {
+ 	}
+ 	return "local"
+ }
++
++// detectMoves finds files that moved on Drive since the last sync, returning
++// newPath -> oldPath. Matching is by Drive file ID: it is the only identity
++// that survives a move, since local hashes are sha256 and Drive reports md5,
++// so content cannot be compared across the boundary.
++//
++// Only unambiguous moves qualify. The destination must be untracked and
++// unoccupied locally, the source must still be on disk, and the content must
++// be unchanged on both sides -- anything else is a move tangled up with an
++// edit, and is left to the ordinary per-path rules, which are conservative
++// and will not lose data.
++func detectMoves(local map[string]model.FileMetadata, remote map[string]RemoteEntry, baseline map[string]model.SyncRecord) map[string]string {
++	byFileID := make(map[string]string, len(baseline))
++	for path, rec := range baseline {
++		if rec.DriveFileID != "" && !rec.Deleted {
++			byFileID[rec.DriveFileID] = path
++		}
++	}
++
++	moves := make(map[string]string)
++	for newPath, r := range remote {
++		if r.FileID == "" {
++			continue
++		}
++		oldPath, known := byFileID[r.FileID]
++		if !known || oldPath == newPath {
++			continue
++		}
++		if _, tracked := baseline[newPath]; tracked {
++			continue
++		}
++		if _, occupied := local[newPath]; occupied {
++			continue
++		}
++		oldLocal, present := local[oldPath]
++		if !present {
++			continue
++		}
++		oldBaseline := baseline[oldPath]
++		if oldLocal.Hash != oldBaseline.LocalHash || r.MD5 != oldBaseline.DriveMD5 {
++			continue
++		}
++		moves[newPath] = oldPath
++	}
++	return moves
++}
+diff --git a/internal/syncengine/executor.go b/internal/syncengine/executor.go
+index c7ec08a..7f3e92a 100644
+--- a/internal/syncengine/executor.go
++++ b/internal/syncengine/executor.go
+@@ -5,6 +5,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 
+ 	"context"
+@@ -106,6 +107,8 @@ func (e *Executor) execute(ctx context.Context, op Operation) error {
+ 		return e.pushDelete(ctx, op)
+ 	case DecisionPullDelete:
+ 		return e.pullDelete(ctx, op)
++	case DecisionMoveLocal:
++		return e.moveLocal(op)
+ 	case DecisionConflict:
+ 		if op.Winner == "remote" {
+ 			return e.pull(ctx, op)
+@@ -231,9 +234,66 @@ func (e *Executor) pullDelete(_ context.Context, op Operation) error {
+ 		return fmt.Errorf("syncengine: pull-deleting %s: %w", op.RelativePath, err)
+ 	}
+ 	e.store.Delete(op.RelativePath)
++	pruneEmptyDirs(e.vaultRoot, filepath.Dir(absPath))
+ 	return nil
+ }
+ 
++// moveLocal relocates a file whose Drive counterpart moved, rather than
++// deleting it here and downloading it again there. The content is already on
++// disk and byte-identical, so a rename is both cheaper and safer: it never
++// leaves the old path without a baseline record, which is what let a stale
++// copy be re-uploaded and the move undone.
++func (e *Executor) moveLocal(op Operation) error {
++	if op.Remote == nil || op.Baseline == nil || op.OldRelativePath == "" {
++		return fmt.Errorf("syncengine: move %s: incomplete move metadata", op.RelativePath)
++	}
++
++	oldAbs := filepath.Join(e.vaultRoot, filepath.FromSlash(op.OldRelativePath))
++	newAbs := filepath.Join(e.vaultRoot, filepath.FromSlash(op.RelativePath))
++
++	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
++		return fmt.Errorf("syncengine: creating local dir for %s: %w", op.RelativePath, err)
++	}
++	if err := os.Rename(oldAbs, newAbs); err != nil {
++		return fmt.Errorf("syncengine: moving %s -> %s: %w", op.OldRelativePath, op.RelativePath, err)
++	}
++
++	rec := *op.Baseline
++	rec.RelativePath = op.RelativePath
++	rec.DriveFileID = op.Remote.FileID
++	rec.DriveMD5 = op.Remote.MD5
++	rec.DriveModTime = op.Remote.ModTime
++	rec.DriveParentID = op.Remote.ParentID
++
++	e.store.Delete(op.OldRelativePath)
++	e.store.Set(rec)
++
++	pruneEmptyDirs(e.vaultRoot, filepath.Dir(oldAbs))
++	return nil
++}
++
++// pruneEmptyDirs removes dir and any parents it empties, stopping at the
++// vault root. A move or a remote deletion otherwise leaves the emptied
++// directory behind forever -- nothing else ever removes one, since the
++// engine tracks files and not directories.
++func pruneEmptyDirs(vaultRoot, dir string) {
++	root := filepath.Clean(vaultRoot)
++	for {
++		dir = filepath.Clean(dir)
++		if dir == root || !strings.HasPrefix(dir, root+string(filepath.Separator)) {
++			return
++		}
++		entries, err := os.ReadDir(dir)
++		if err != nil || len(entries) > 0 {
++			return
++		}
++		if err := os.Remove(dir); err != nil {
++			return
++		}
++		dir = filepath.Dir(dir)
++	}
++}
++
+ // ensureParentFolder resolves (creating if needed) the Drive folder for
+ // relPath's parent directory. The folderCache resolves each directory
+ // exactly once for the lifetime of this Executor, so workers pushing into
+diff --git a/internal/syncengine/move_test.go b/internal/syncengine/move_test.go
+new file mode 100644
+index 0000000..d9caf86
+--- /dev/null
++++ b/internal/syncengine/move_test.go
+@@ -0,0 +1,199 @@
++package syncengine
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"obsynk/internal/model"
++	"obsynk/internal/statestore"
++)
++
++func decisionsByPath(results []DiffResult) map[string]Decision {
++	out := make(map[string]Decision, len(results))
++	for _, r := range results {
++		out[r.RelativePath] = r.Decision
++	}
++	return out
++}
++
++// The reported bug: a file moved on one machine arrived on the other as a
++// second copy, with the original left in place. Treated per path, the move
++// is a deletion here and an unrelated creation there.
++func TestDiffDetectsRemoteMoveAsOneOperation(t *testing.T) {
++	t.Parallel()
++
++	local := map[string]model.FileMetadata{
++		"Notes/a.md": {RelativePath: "Notes/a.md", Hash: "H1"},
++	}
++	remote := map[string]RemoteEntry{
++		"Archive/a.md": {RelativePath: "Archive/a.md", FileID: "X", MD5: "M1", ParentID: "archive-folder"},
++	}
++	baseline := map[string]model.SyncRecord{
++		"Notes/a.md": {RelativePath: "Notes/a.md", LocalHash: "H1", DriveFileID: "X", DriveMD5: "M1"},
++	}
++
++	results := Diff(local, remote, baseline)
++	if len(results) != 1 {
++		t.Fatalf("got %d results, want 1 move: %v", len(results), decisionsByPath(results))
++	}
++	r := results[0]
++	if r.Decision != DecisionMoveLocal {
++		t.Errorf("decision = %s, want move_local", r.Decision)
++	}
++	if r.RelativePath != "Archive/a.md" || r.OldRelativePath != "Notes/a.md" {
++		t.Errorf("move %q -> %q, want Notes/a.md -> Archive/a.md", r.OldRelativePath, r.RelativePath)
++	}
++	// The old path must not also be reported: emitting a create_remote for it
++	// is what re-uploaded the stale copy and undid the move on Drive.
++	if d, ok := decisionsByPath(results)["Notes/a.md"]; ok {
++		t.Errorf("old path also produced %s", d)
++	}
++}
++
++// Anything less than an unambiguous move falls back to the ordinary rules
++// rather than renaming a file out from under a change.
++func TestDiffLeavesAmbiguousMovesAlone(t *testing.T) {
++	t.Parallel()
++
++	base := func() (map[string]model.FileMetadata, map[string]RemoteEntry, map[string]model.SyncRecord) {
++		return map[string]model.FileMetadata{
++				"Notes/a.md": {RelativePath: "Notes/a.md", Hash: "H1"},
++			},
++			map[string]RemoteEntry{
++				"Archive/a.md": {RelativePath: "Archive/a.md", FileID: "X", MD5: "M1"},
++			},
++			map[string]model.SyncRecord{
++				"Notes/a.md": {RelativePath: "Notes/a.md", LocalHash: "H1", DriveFileID: "X", DriveMD5: "M1"},
++			}
++	}
++
++	t.Run("local edited since last sync", func(t *testing.T) {
++		t.Parallel()
++		local, remote, baseline := base()
++		local["Notes/a.md"] = model.FileMetadata{RelativePath: "Notes/a.md", Hash: "EDITED"}
++		for _, r := range Diff(local, remote, baseline) {
++			if r.Decision == DecisionMoveLocal {
++				t.Error("renamed a file that had local edits")
++			}
++		}
++	})
++
++	t.Run("content also changed remotely", func(t *testing.T) {
++		t.Parallel()
++		local, remote, baseline := base()
++		remote["Archive/a.md"] = RemoteEntry{RelativePath: "Archive/a.md", FileID: "X", MD5: "M2"}
++		for _, r := range Diff(local, remote, baseline) {
++			if r.Decision == DecisionMoveLocal {
++				t.Error("treated a move-plus-edit as a plain move")
++			}
++		}
++	})
++
++	t.Run("destination already occupied locally", func(t *testing.T) {
++		t.Parallel()
++		local, remote, baseline := base()
++		local["Archive/a.md"] = model.FileMetadata{RelativePath: "Archive/a.md", Hash: "OTHER"}
++		for _, r := range Diff(local, remote, baseline) {
++			if r.Decision == DecisionMoveLocal {
++				t.Error("would have overwritten an unrelated file at the destination")
++			}
++		}
++	})
++
++	t.Run("source no longer on disk", func(t *testing.T) {
++		t.Parallel()
++		_, remote, baseline := base()
++		results := Diff(map[string]model.FileMetadata{}, remote, baseline)
++		for _, r := range results {
++			if r.Decision == DecisionMoveLocal {
++				t.Error("tried to move a file that isn't there")
++			}
++		}
++		if got := decisionsByPath(results)["Archive/a.md"]; got != DecisionCreateLocal {
++			t.Errorf("Archive/a.md = %s, want create_local", got)
++		}
++	})
++}
++
++func TestExecutorMoveLocalRenamesAndReparentsRecord(t *testing.T) {
++	t.Parallel()
++
++	vault := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(vault, "Notes", "sub"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	oldPath := filepath.Join(vault, "Notes", "sub", "a.md")
++	if err := os.WriteFile(oldPath, []byte("content"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	e := &Executor{vaultRoot: vault, store: newTestStore(t)}
++	op := Operation{
++		Kind:            DecisionMoveLocal,
++		RelativePath:    "Archive/a.md",
++		OldRelativePath: "Notes/sub/a.md",
++		Local:           &model.FileMetadata{RelativePath: "Notes/sub/a.md", Hash: "H1"},
++		Remote:          &RemoteEntry{RelativePath: "Archive/a.md", FileID: "X", MD5: "M1", ParentID: "archive-folder"},
++		Baseline:        &model.SyncRecord{RelativePath: "Notes/sub/a.md", LocalHash: "H1", DriveFileID: "X", DriveMD5: "M1"},
++	}
++	if err := e.moveLocal(op); err != nil {
++		t.Fatalf("moveLocal: %v", err)
++	}
++
++	if _, err := os.Stat(filepath.Join(vault, "Archive", "a.md")); err != nil {
++		t.Errorf("file not at its new path: %v", err)
++	}
++	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
++		t.Error("original still present after the move")
++	}
++	// Emptied directories are pruned; nothing else ever removes them.
++	if _, err := os.Stat(filepath.Join(vault, "Notes")); !os.IsNotExist(err) {
++		t.Error("emptied Notes/ left behind")
++	}
++
++	if _, ok := e.store.Get("Notes/sub/a.md"); ok {
++		t.Error("baseline record kept at the old path")
++	}
++	rec, ok := e.store.Get("Archive/a.md")
++	if !ok {
++		t.Fatal("no baseline record at the new path")
++	}
++	if rec.DriveParentID != "archive-folder" || rec.DriveFileID != "X" || rec.LocalHash != "H1" {
++		t.Errorf("record not carried over correctly: %+v", rec)
++	}
++}
++
++func TestPruneEmptyDirsStopsAtVaultRootAndNonEmpty(t *testing.T) {
++	t.Parallel()
++
++	vault := t.TempDir()
++	keep := filepath.Join(vault, "Keep")
++	if err := os.MkdirAll(filepath.Join(keep, "empty"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(keep, "other.md"), []byte("x"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	pruneEmptyDirs(vault, filepath.Join(keep, "empty"))
++
++	if _, err := os.Stat(filepath.Join(keep, "empty")); !os.IsNotExist(err) {
++		t.Error("empty dir not pruned")
++	}
++	if _, err := os.Stat(keep); err != nil {
++		t.Error("pruned a directory that still had a file in it")
++	}
++	if _, err := os.Stat(vault); err != nil {
++		t.Error("pruned past the vault root")
++	}
++}
++
++func newTestStore(t *testing.T) *statestore.Store {
++	t.Helper()
++	s, err := statestore.Open(filepath.Join(t.TempDir(), "manifest.json"), "/vault")
++	if err != nil {
++		t.Fatal(err)
++	}
++	return s
++}
+diff --git a/internal/syncengine/plan.go b/internal/syncengine/plan.go
+index 06ca20c..9da219f 100644
+--- a/internal/syncengine/plan.go
++++ b/internal/syncengine/plan.go
+@@ -19,6 +19,10 @@ type Operation struct {
+ 
+ 	// Winner is "local" or "remote", set only when Kind == DecisionConflict.
+ 	Winner string
++
++	// OldRelativePath is the file's current location on disk, set only when
++	// Kind == DecisionMoveLocal.
++	OldRelativePath string
+ }
+ 
+ // Plan converts DiffResults into Operations, dropping DecisionNone entries
+@@ -35,12 +39,13 @@ func Plan(results []DiffResult) []Operation {
+ 			continue
+ 		}
+ 		ops = append(ops, Operation{
+-			Kind:         r.Decision,
+-			RelativePath: r.RelativePath,
+-			Local:        r.Local,
+-			Remote:       r.Remote,
+-			Baseline:     r.Baseline,
+-			Winner:       r.Winner,
++			Kind:            r.Decision,
++			RelativePath:    r.RelativePath,
++			Local:           r.Local,
++			Remote:          r.Remote,
++			Baseline:        r.Baseline,
++			Winner:          r.Winner,
++			OldRelativePath: r.OldRelativePath,
+ 		})
+ 	}
+ 
+-- 
+2.47.0.windows.2
+
