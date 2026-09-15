@@ -91,5 +91,6 @@ func main() {
 	}
 
 	grpcSrv.GracefulStop()
+	srv.Close()
 	log.Print("obsynkd: stopped")
 }
