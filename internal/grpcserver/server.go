@@ -44,6 +44,13 @@ type Server struct {
 
 	stopCh chan struct{}
 
+	// lifeCtx spans the daemon's whole run and is what the Drive client is
+	// built from. oauth2 captures the context it is given and reuses it for
+	// every token refresh, so anything request-scoped produces a client that
+	// silently stops being able to refresh once its access token expires.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
 	// syncSem serializes syncs: capacity 1, held for the whole of one sync
 	// including result streaming. Two syncs must never overlap -- they would
 	// each build their own folderCache, so each would create its own copy of
@@ -56,6 +63,7 @@ type Server struct {
 // already present (e.g. this is a daemon restart, not the first run).
 func NewServer(version, vaultPath string) (*Server, error) {
 	dataDir := filepath.Join(vaultPath, ".obsidian", "plugins", "obsynk")
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 
 	s := &Server{
 		version:      version,
@@ -65,6 +73,8 @@ func NewServer(version, vaultPath string) (*Server, error) {
 		manifestPath: filepath.Join(dataDir, "sync-state.json"),
 		stopCh:       make(chan struct{}),
 		syncSem:      make(chan struct{}, 1),
+		lifeCtx:      lifeCtx,
+		lifeCancel:   lifeCancel,
 	}
 
 	cfg, err := config.Load(s.configPath)
@@ -110,7 +120,10 @@ func (s *Server) initDrive(ctx context.Context) error {
 	s.mu.Unlock()
 
 	cache := drive.FileTokenCache{Path: s.tokenPath}
-	client, err := drive.NewClient(ctx, creds, cache)
+	// Deliberately lifeCtx and not ctx: ctx here is a startup timeout or an
+	// RPC's context, and the token source outlives both. Real API calls
+	// below still use ctx.
+	client, err := drive.NewClient(s.lifeCtx, creds, cache)
 	if err != nil {
 		return fmt.Errorf("connecting to drive: %w", err)
 	}
@@ -364,6 +377,13 @@ func (s *Server) streamResults(stream grpc.ServerStreamingServer[obsynkv1.SyncPr
 	s.mu.Unlock()
 
 	return nil
+}
+
+// Close releases the daemon-lifetime context. Call it once the gRPC server
+// has stopped serving, not when shutdown is first requested: in-flight syncs
+// may still need a token refresh while the server drains.
+func (s *Server) Close() {
+	s.lifeCancel()
 }
 
 func (s *Server) Shutdown(ctx context.Context, req *obsynkv1.ShutdownRequest) (*obsynkv1.ShutdownResponse, error) {

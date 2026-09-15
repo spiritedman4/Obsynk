@@ -16,6 +16,16 @@ type Client struct {
 // NewClient builds a Drive client from a cached OAuth token, refreshing it
 // automatically as needed. Returns an error if no token is cached yet --
 // the caller should run LoginInteractive first in that case.
+//
+// The token source is deliberately detached from ctx's cancellation.
+// oauth2 captures whatever context it is handed and reuses it for every
+// future refresh, so a request-scoped or timeout context -- a startup
+// deadline, or an RPC that has since returned -- produces a client that
+// works only until its access token expires, then fails every call with
+// "oauth2.googleapis.com/token: context canceled". Detaching here means no
+// caller can reintroduce that by passing the wrong context. Values are
+// preserved, so an oauth2.HTTPClient override still applies; individual API
+// calls carry their own contexts and are unaffected.
 func NewClient(ctx context.Context, creds Credentials, cache TokenCache) (*Client, error) {
 	tok, err := cache.Load()
 	if err != nil {
@@ -23,9 +33,10 @@ func NewClient(ctx context.Context, creds Credentials, cache TokenCache) (*Clien
 	}
 
 	cfg := oauthConfig(creds, "")
-	ts := &savingTokenSource{inner: cfg.TokenSource(ctx, tok), cache: cache, last: tok}
+	refreshCtx := context.WithoutCancel(ctx)
+	ts := &savingTokenSource{inner: cfg.TokenSource(refreshCtx, tok), cache: cache, last: tok}
 
-	svc, err := drivev3.NewService(ctx, option.WithTokenSource(ts))
+	svc, err := drivev3.NewService(refreshCtx, option.WithTokenSource(ts))
 	if err != nil {
 		return nil, fmt.Errorf("drive: creating service: %w", err)
 	}
